@@ -18,6 +18,7 @@
 #include "core/log.h"
 #include "game/renderer.h"
 #include "renderer/state_backup.h"
+#include "renderer/padding_state.h"
 #include "renderer/resource_slots.h"
 #include "renderer/taa_dlss.h"
 
@@ -432,12 +433,8 @@ struct ClampFill {
         // One viewport uses scissor slot0 only. Two rectangles leave the bottom
         // strip unwritten; the pixel shader already discards the valid sub-rect.
         const D3D11_RECT rect = {0, 0, LONG(bx), LONG(by)};
-        StateBackup backup(ctx);
-        // The texture is bound as an input: unbind the inputs before binding it for writing.
-        ID3D11ShaderResourceView* null_srv[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
-        ctx->VSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, null_srv);
-        ctx->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, null_srv);
-        ctx->CSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, null_srv);
+        PaddingStateBackup backup(ctx, device);
+        backup.unbind_inputs();
         ctx->OMSetRenderTargets(1, &rtv, nullptr);
         ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
         ctx->OMSetDepthStencilState(nullptr, 0);
