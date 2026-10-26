@@ -2,7 +2,7 @@
 #include <d3d11.h>
 
 namespace kc::subrect_fixes {
-enum class Kind { None, Stencil, Contact, Bloom };
+enum class Kind { None, Stencil, Contact, Bloom, Caustics };
 struct Shader {
     Kind kind = Kind::None;
     ID3D11PixelShader* replacement = nullptr;
@@ -16,6 +16,7 @@ struct DrawState {
     ID3D11PixelShader* original = nullptr;
     ID3D11Buffer* params = nullptr;
     bool contact = false;
+    bool caustics = false;
 };
 // Render thread, inside ScopedInside. The caller restores this state after every draw path.
 DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader* original);

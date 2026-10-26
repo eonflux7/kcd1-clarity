@@ -9,6 +9,7 @@
 
 #include "core/log.h"
 #include "renderer/dxbc_patch.h"
+#include "renderer/caustics_fix.h"
 #include "renderer/taa_dlss.h"
 
 namespace kc::subrect_fixes {
@@ -23,6 +24,8 @@ std::map<ID3D11PixelShader*, Entry> g_ps;
 std::map<ID3D11VertexShader*, ComPtr<ID3D11VertexShader>> g_bloom_vs;
 ComPtr<ID3D11Device> g_device;
 ComPtr<ID3D11Buffer> g_params;
+// Process-lifetime GPU cache: do not call D3D Release from DLL detach under the loader lock.
+CausticsDepthPatch* g_caustics = nullptr;
 
 bool hash_is(const void* code, SIZE_T size, const char* hash) {
     const auto* p = static_cast<const unsigned char*>(code);
@@ -52,6 +55,8 @@ void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11Pix
     else if (hash_is(code, size, "605729c33fe3e25d2ab7d10740ac8bab") ||
              hash_is(code, size, "84962ebe5751261dcade7dc5f97345dc"))
         kind = Kind::Bloom;
+    else if (hash_is(code, size, "4006e5a4dbb3eca402502c4ae3cdf9e7"))
+        kind = Kind::Caustics;
     if (kind == Kind::None)
         return;
     Entry entry{};
@@ -99,8 +104,17 @@ bool is_bloom_vs(ID3D11VertexShader* shader) {
 DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader* original) {
     DrawState old;
     const auto& settings = taa_dlss::settings();
-    if (!original || !shader.replacement || settings.mode != taa_dlss::Mode::Dlss ||
+    if (!original || settings.mode != taa_dlss::Mode::Dlss ||
         settings.render_scale >= .999f)
+        return old;
+    if (shader.kind == Kind::Caustics) {
+        if (!g_caustics)
+            g_caustics = new CausticsDepthPatch;
+        old.params = g_caustics->before_draw(ctx);
+        old.caustics = old.params != nullptr;
+        return old;
+    }
+    if (!shader.replacement)
         return old;
     if (shader.kind == Kind::Contact) {
         ComPtr<ID3D11ShaderResourceView> srv;
@@ -153,6 +167,11 @@ DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader
     return old;
 }
 void after_draw(ID3D11DeviceContext* ctx, DrawState& old) {
+    if (old.caustics) {
+        CausticsDepthPatch::after_draw(ctx, old.params);
+        old = {};
+        return;
+    }
     if (!old.original)
         return;
     ctx->PSSetShader(old.original, nullptr, 0);
