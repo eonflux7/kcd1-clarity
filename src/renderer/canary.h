@@ -60,8 +60,9 @@ void on_present();
 // Render thread, at the engine's TAA draw, after before_draw: no fills for the rest of the frame.
 void on_taa_draw();
 // Render thread, before an engine draw / dispatch: fill the bound inputs. draw: the unhooked Draw.
-void before_draw(ID3D11DeviceContext* ctx, DrawFn draw);
-void before_dispatch(ID3D11DeviceContext* ctx, DrawFn draw);
+void before_draw(ID3D11DeviceContext* ctx, DrawFn draw, uint32_t vs_slots = ~uint32_t(0),
+                 uint32_t ps_slots = ~uint32_t(0));
+void before_dispatch(ID3D11DeviceContext* ctx, DrawFn draw, uint32_t cs_slots = ~uint32_t(0));
 // A recognized bloom draw filled an entire target. Do not pad/poison this resource.
 void preserve_full_target(ID3D11DeviceContext* ctx);
 // Render thread: these targets are about to be written (OMSetRenderTargets) / were written (dispatch UAVs).

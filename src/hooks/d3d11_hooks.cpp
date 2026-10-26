@@ -14,6 +14,7 @@
 #include "core/log.h"
 #include "game/renderer.h"
 #include "renderer/canary.h"
+#include "renderer/resource_slots.h"
 #include "renderer/subrect_fixes.h"
 #include "renderer/mip_bias.h"
 #include "renderer/screen_size_fix.h"
@@ -106,6 +107,8 @@ static ID3D11ComputeShader* g_bound_cs;             // render thread
 static const screen_size_fix::Shader* g_bound_fix_cs;
 static subrect_fixes::Shader g_bound_subrect;
 static bool g_bound_bloom_vs;
+static UINT g_ps_classes, g_vs_classes, g_cs_classes;
+static uint32_t g_ps_slots = resource_slots::all, g_vs_slots = resource_slots::all, g_cs_slots = resource_slots::all;
 static thread_local bool t_inside;         // our own draws do not re-enter
 
 const Status& status() { return g_status; }
@@ -174,6 +177,7 @@ static HRESULT STDMETHODCALLTYPE hk_create_pixel_shader(ID3D11Device* device, co
                                                         ID3D11ClassLinkage* linkage, ID3D11PixelShader** out) {
     HRESULT hr = o_create_pixel_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
+        resource_slots::tag(*out, code, size);
         {
             ScopedInside inside;
             subrect_fixes::on_create_ps(device, code, size, *out);
@@ -204,6 +208,7 @@ static HRESULT STDMETHODCALLTYPE hk_create_vertex_shader(ID3D11Device* device, c
                                                          ID3D11ClassLinkage* linkage, ID3D11VertexShader** out) {
     HRESULT hr = o_create_vertex_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
+        resource_slots::tag(*out, code, size);
         subrect_fixes::on_create_vs(code, size, *out);
         screen_size_fix::Shader f;
         if (screen_size_fix::reflect_vs(code, size, &f)) {
@@ -256,6 +261,7 @@ static HRESULT STDMETHODCALLTYPE hk_create_compute_shader(ID3D11Device* device, 
                                                           ID3D11ClassLinkage* linkage, ID3D11ComputeShader** out) {
     HRESULT hr = o_create_compute_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
+        resource_slots::tag(*out, code, size);
         screen_size_fix::Shader f;
         if (screen_size_fix::reflect_cs(code, size, &f)) {
             f.shader = *out;
@@ -270,8 +276,10 @@ static HRESULT STDMETHODCALLTYPE hk_create_compute_shader(ID3D11Device* device, 
 
 static void STDMETHODCALLTYPE hk_cs_set_shader(ID3D11DeviceContext* ctx, ID3D11ComputeShader* cs,
                                                ID3D11ClassInstance* const* inst, UINT n) {
-    if (cs != g_bound_cs && !t_inside) {
+    if ((cs != g_bound_cs || n != g_cs_classes) && !t_inside) {
         g_bound_cs = cs;
+        g_cs_classes = n;
+        g_cs_slots = resource_slots::get(cs, n);
         g_bound_fix_cs = nullptr;
         if (cs) {
             std::lock_guard lock(g_mutex);
@@ -340,7 +348,12 @@ static void canary_before_draw(ID3D11DeviceContext* ctx) {
     if (t_inside)
         return;
     t_inside = true;
-    canary::before_draw(ctx, o_draw);
+    uint32_t ps_slots = g_ps_slots;
+    // DLSS consumes the reflected TAA inputs even if this engine variant does not.
+    if (g_bound_taa)
+        for (UINT slot : {g_bound_taa->slot_colour, g_bound_taa->slot_depth, g_bound_taa->slot_velocity})
+            if (slot < 32) ps_slots |= uint32_t(1) << slot;
+    canary::before_draw(ctx, o_draw, g_vs_slots, ps_slots);
     t_inside = false;
 }
 
@@ -370,7 +383,7 @@ static void STDMETHODCALLTYPE hk_dispatch(ID3D11DeviceContext* ctx, UINT x, UINT
         return;
     }
     t_inside = true;
-    canary::before_dispatch(ctx, o_draw);
+    canary::before_dispatch(ctx, o_draw, g_cs_slots);
     if (g_bound_fix_cs)
         screen_size_fix::dispatch(ctx, *g_bound_fix_cs, x, y, z, o_dispatch);
     else
@@ -381,8 +394,10 @@ static void STDMETHODCALLTYPE hk_dispatch(ID3D11DeviceContext* ctx, UINT x, UINT
 
 static void STDMETHODCALLTYPE hk_vs_set_shader(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs,
                                                ID3D11ClassInstance* const* inst, UINT n) {
-    if (vs != g_bound_vs && !t_inside) {
+    if ((vs != g_bound_vs || n != g_vs_classes) && !t_inside) {
         g_bound_vs = vs;
+        g_vs_classes = n;
+        g_vs_slots = resource_slots::get(vs, n);
         g_bound_bloom_vs = subrect_fixes::is_bloom_vs(vs);
         g_bound_fix_vs = nullptr;
         if (vs) {
@@ -399,8 +414,10 @@ static void STDMETHODCALLTYPE hk_vs_set_shader(ID3D11DeviceContext* ctx, ID3D11V
 
 static void STDMETHODCALLTYPE hk_ps_set_shader(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
                                                ID3D11ClassInstance* const* inst, UINT n) {
-    if (ps != g_bound_ps && !t_inside) {
+    if ((ps != g_bound_ps || n != g_ps_classes) && !t_inside) {
         g_bound_ps = ps;
+        g_ps_classes = n;
+        g_ps_slots = resource_slots::get(ps, n);
         g_bound_subrect = subrect_fixes::find_ps(ps);
         g_bound_taa = nullptr;
         g_bound_fix = nullptr;

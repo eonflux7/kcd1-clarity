@@ -2,6 +2,7 @@
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <cmath>
@@ -10,12 +11,14 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "core/log.h"
 #include "game/renderer.h"
 #include "renderer/state_backup.h"
+#include "renderer/resource_slots.h"
 #include "renderer/taa_dlss.h"
 
 namespace kc::canary {
@@ -31,6 +34,16 @@ static game::Vec2 g_native;
 // (texture, mip) filled since it was last bound for writing, this frame.
 static std::unordered_set<uint64_t> g_filled;
 static std::unordered_set<void*> g_textures;
+// Descriptors are immutable. Hold references so a released view address cannot
+// identify a different input later in the frame. Writes still invalidate g_filled.
+struct Input {
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+    D3D11_TEXTURE2D_DESC texture{};
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+    bool screen = false;
+};
+static std::unordered_map<ID3D11ShaderResourceView*, Input> g_inputs;
 // References prevent pointer reuse until Present; a new write removes the exemption.
 static std::vector<ID3D11Resource*> g_full_layout;
 static void clear_full_layout() {
@@ -133,6 +146,7 @@ void on_present() {
     g_status = g_frame;
     g_frame = {};
     g_filled.clear();
+    g_inputs.clear();
     clear_full_layout();
     g_textures.clear();
     const bool had_taa = g_taa_this_frame;
@@ -587,29 +601,31 @@ static void fill_inputs(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* cons
         ID3D11ShaderResourceView* srv = srvs[i];
         if (!srv)
             continue;
-        ID3D11Resource* res = nullptr;
-        srv->GetResource(&res);
-        if (std::find(g_full_layout.begin(), g_full_layout.end(), res) != g_full_layout.end()) {
-            res->Release();
-            continue;
+        auto [it, inserted] = g_inputs.try_emplace(srv);
+        Input& input = it->second;
+        if (inserted) {
+            input.view = srv;
+            srv->GetResource(&input.resource);
+            D3D11_RESOURCE_DIMENSION dim;
+            input.resource->GetType(&dim);
+            if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+                static_cast<ID3D11Texture2D*>(input.resource.Get())->GetDesc(&input.texture);
+            const auto& td = input.texture;
+            input.screen = td.Height > 0 && td.Width <= UINT(g_native.x) &&
+                           fabsf(float(td.Width) / float(td.Height) / (g_native.x / g_native.y) - 1.0f) < 0.01f;
+            if (input.screen)
+                srv->GetDesc(&input.desc);
         }
-        D3D11_RESOURCE_DIMENSION dim;
-        res->GetType(&dim);
-        D3D11_TEXTURE2D_DESC td = {};
-        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-            static_cast<ID3D11Texture2D*>(res)->GetDesc(&td);
-        const bool screen = td.Height > 0 && td.Width <= UINT(g_native.x) &&
-                            fabsf(float(td.Width) / float(td.Height) / (g_native.x / g_native.y) - 1.0f) < 0.01f;
-        if (!screen) {
-            res->Release();
+        if (!input.screen)
             continue;
-        }
-        D3D11_SHADER_RESOURCE_VIEW_DESC vd;
-        srv->GetDesc(&vd);
+        ID3D11Resource* res = input.resource.Get();
+        if (std::find(g_full_layout.begin(), g_full_layout.end(), res) != g_full_layout.end())
+            continue;
+        const auto& td = input.texture;
+        const auto& vd = input.desc;
         if (vd.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || td.SampleDesc.Count > 1) {
             if (g_filled.insert(key(res, 15)).second)
                 ++g_frame.skipped;
-            res->Release();
             continue;
         }
         if (!device)
@@ -636,33 +652,47 @@ static void fill_inputs(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* cons
                 logf("canary: filling %ux%u format %d mip %u (sub-rect %ux%u)%s", td.Width, td.Height, vd.Format, m,
                      sw, sh, td.BindFlags & D3D11_BIND_DEPTH_STENCIL ? " depth" : "");
         }
-        res->Release();
     }
     if (device)
         device->Release();
 }
 
-void before_draw(ID3D11DeviceContext* ctx, DrawFn draw) {
+void before_draw(ID3D11DeviceContext* ctx, DrawFn draw, uint32_t vs_slots, uint32_t ps_slots) {
     invalidate_outputs(ctx, false);
     if (!on() || !g_armed || !g_status.active)
         return;
     ID3D11ShaderResourceView* srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
     constexpr UINT kSlots = 32;  // the engine binds far fewer
-    ctx->VSGetShaderResources(0, kSlots, srvs);
-    ctx->PSGetShaderResources(0, kSlots, srvs + kSlots);
+    const UINT nv = resource_slots::count(vs_slots), np = resource_slots::count(ps_slots);
+    if (nv) ctx->VSGetShaderResources(0, nv, srvs);
+    if (np) ctx->PSGetShaderResources(0, np, srvs + kSlots);
+    // Release unused bindings before filtering; never mutate the actual context.
+    for (UINT i = 0; i < kSlots; ++i) {
+        if (!(vs_slots & (uint32_t(1) << i)) && srvs[i]) {
+            srvs[i]->Release(); srvs[i] = nullptr;
+        }
+        if (!(ps_slots & (uint32_t(1) << i)) && srvs[i + kSlots]) {
+            srvs[i + kSlots]->Release(); srvs[i + kSlots] = nullptr;
+        }
+    }
     fill_inputs(ctx, srvs, 2 * kSlots, draw);
     for (UINT i = 0; i < 2 * kSlots; ++i)
         if (srvs[i])
             srvs[i]->Release();
 }
 
-void before_dispatch(ID3D11DeviceContext* ctx, DrawFn draw) {
+void before_dispatch(ID3D11DeviceContext* ctx, DrawFn draw, uint32_t cs_slots) {
     invalidate_outputs(ctx, true);
     if (!on() || !g_armed || !g_status.active)
         return;
     constexpr UINT kSlots = 32;
     ID3D11ShaderResourceView* srvs[kSlots] = {};
-    ctx->CSGetShaderResources(0, kSlots, srvs);
+    const UINT n = resource_slots::count(cs_slots);
+    if (n) ctx->CSGetShaderResources(0, n, srvs);
+    for (UINT i = 0; i < n; ++i)
+        if (!(cs_slots & (uint32_t(1) << i)) && srvs[i]) {
+            srvs[i]->Release(); srvs[i] = nullptr;
+        }
     fill_inputs(ctx, srvs, kSlots, draw);
     for (ID3D11ShaderResourceView* s : srvs)
         if (s)
