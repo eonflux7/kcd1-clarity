@@ -526,6 +526,9 @@ static void draw_probe_section() {
                         (unsigned long long)fs.edge_padded);
     ImGui::SameLine();
     ImGui::TextDisabled("%llu draws fixed", (unsigned long long)game::fullscreen_uv_fixes());
+    ImGui::Checkbox("Fix SSDO noise tiling (wall stripes)", &screen_size_fix::status().ssdo_noise);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%llu draws", (unsigned long long)fs.ssdo_noise_fixed);
     canary::Settings& cs = canary::settings();
     const canary::Status& cst = canary::status();
     if (ImGui::Checkbox("Clamp at the sub-rect edge (light leaks)", &cs.clamp)) {
