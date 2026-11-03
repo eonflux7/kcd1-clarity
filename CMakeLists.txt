@@ -8,6 +8,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Static CRT: nothing extra to install next to the game.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_POLICY_DEFAULT_CMP0135 NEW)
+# WHGame.dll differs between the Steam and GOG releases: pick which build's symbol RVAs to compile in.
+option(KCD_GOG "Use the GOG WHGame.dll symbol table instead of the Steam one" OFF)
 
 include(FetchContent)
 # SOURCE_SUBDIR points at a missing dir so FetchContent only downloads; targets are defined below.
@@ -90,6 +92,9 @@ set_target_properties(kcd_clarity PROPERTIES OUTPUT_NAME dinput8)
 target_include_directories(kcd_clarity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${DLSS_SDK_DIR}/include)
 target_compile_definitions(kcd_clarity PRIVATE
     KC_VERSION="${PROJECT_VERSION}" WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+if(KCD_GOG)
+    target_compile_definitions(kcd_clarity PRIVATE KCD_GOG_SYMBOLS)
+endif()
 target_compile_options(kcd_clarity PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/permissive->")
 # No static import of d3d11/dxgi: the loader waits for the game to load d3d11.dll itself.
 # d3dcompiler (ImGui DX11 backend, depth-copy shader) is delay-loaded so the proxy pulls in nothing at process start.
