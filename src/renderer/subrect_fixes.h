@@ -7,11 +7,10 @@ struct Shader {
     Kind kind = Kind::None;
     ID3D11PixelShader* replacement = nullptr;
 };
-// Creation callbacks must run inside d3d11::ScopedInside; cache owns shader references.
-void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11PixelShader* shader);
-void on_create_vs(const void* code, SIZE_T size, ID3D11VertexShader* shader);
-Shader find_ps(ID3D11PixelShader* shader);
-bool is_bloom_vs(ID3D11VertexShader* shader);
+// Classifies a game pixel shader and builds its replacement. Must run inside d3d11::ScopedInside.
+// Replacements stay alive for the process lifetime; the caller stores the result in the shader's tag.
+Shader classify_ps(ID3D11Device* device, const void* code, SIZE_T size);
+bool is_bloom_vs(const void* code, SIZE_T size);
 struct DrawState {
     ID3D11PixelShader* original = nullptr;
     ID3D11Buffer* params = nullptr;

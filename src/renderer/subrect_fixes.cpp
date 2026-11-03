@@ -3,7 +3,6 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <vector>
 
@@ -16,12 +15,7 @@ namespace kc::subrect_fixes {
 using Microsoft::WRL::ComPtr;
 namespace {
 std::mutex g_mutex;
-struct Entry {
-    Kind kind;
-    ComPtr<ID3D11PixelShader> original, replacement;
-};
-std::map<ID3D11PixelShader*, Entry> g_ps;
-std::map<ID3D11VertexShader*, ComPtr<ID3D11VertexShader>> g_bloom_vs;
+std::vector<ComPtr<ID3D11PixelShader>> g_replacements;  // guarded by g_mutex, never released
 ComPtr<ID3D11Device> g_device;
 ComPtr<ID3D11Buffer> g_params;
 // Process-lifetime GPU cache: do not call D3D Release from DLL detach under the loader lock.
@@ -73,7 +67,7 @@ float4 main(float4 p : SV_Position) : SV_Target {
 })";
 } // namespace
 
-void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11PixelShader* shader) {
+Shader classify_ps(ID3D11Device* device, const void* code, SIZE_T size) {
     Kind kind = Kind::None;
     if (hash_is(code, size, "999180901f1932b132f6eef394ee28f2"))
         kind = Kind::Stencil;
@@ -92,54 +86,35 @@ void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11Pix
     if (kind == Kind::None && water_reflection(code, size))
         kind = Kind::WaterReflection;
     if (kind == Kind::None)
-        return;
-    Entry entry{};
-    entry.kind = kind;
-    entry.original = shader;
+        return {};
+    ComPtr<ID3D11PixelShader> replacement;
     HRESULT hr = S_OK;
     if (kind == Kind::Stencil) {
         ComPtr<ID3DBlob> blob, error;
         hr = D3DCompile(kStencil, sizeof(kStencil) - 1, "subrect_stencil", nullptr, nullptr, "main", "ps_5_0",
                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &error);
         if (SUCCEEDED(hr))
-            hr = device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-                                           &entry.replacement);
-    } else if (kind == Kind::Contact) {
+            hr = device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &replacement);
+    } else if (kind == Kind::Contact || kind == Kind::HairOpaqueContact || kind == Kind::HairContact) {
         std::vector<uint8_t> patched;
-        if (!dxbc::patch_contact_depth_uv(code, size, patched))
-            hr = E_FAIL;
-        else
-            hr = device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.replacement);
-    }
-    if (kind == Kind::HairOpaqueContact || kind == Kind::HairContact) {
-        std::vector<uint8_t> patched;
-        if (!dxbc::patch_forward_depth_origins(code, size, patched))
-            hr = E_FAIL;
-        else
-            hr = device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.replacement);
+        const bool ok = kind == Kind::Contact ? dxbc::patch_contact_depth_uv(code, size, patched)
+                                              : dxbc::patch_forward_depth_origins(code, size, patched);
+        hr = ok ? device->CreatePixelShader(patched.data(), patched.size(), nullptr, &replacement) : E_FAIL;
     }
     if (FAILED(hr)) {
         logf("subrect: shader correction setup failed 0x%08lx", hr);
-        return;
+        return {};
     }
-    std::lock_guard lock(g_mutex);
-    g_ps.emplace(shader, std::move(entry));
+    Shader shader{kind, replacement.Get()};
+    if (replacement) {
+        std::lock_guard lock(g_mutex);
+        g_replacements.push_back(std::move(replacement));
+    }
+    return shader;
 }
 
-void on_create_vs(const void* code, SIZE_T size, ID3D11VertexShader* shader) {
-    if (!hash_is(code, size, "6e7f9495da6310c380b5dfb8a01f1f8b"))
-        return;
-    std::lock_guard lock(g_mutex);
-    g_bloom_vs.emplace(shader, shader);
-}
-Shader find_ps(ID3D11PixelShader* shader) {
-    std::lock_guard lock(g_mutex);
-    auto it = g_ps.find(shader);
-    return it == g_ps.end() ? Shader{} : Shader{it->second.kind, it->second.replacement.Get()};
-}
-bool is_bloom_vs(ID3D11VertexShader* shader) {
-    std::lock_guard lock(g_mutex);
-    return g_bloom_vs.find(shader) != g_bloom_vs.end();
+bool is_bloom_vs(const void* code, SIZE_T size) {
+    return hash_is(code, size, "6e7f9495da6310c380b5dfb8a01f1f8b");
 }
 
 DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader* original) {

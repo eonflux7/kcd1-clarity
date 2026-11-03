@@ -15,6 +15,7 @@
 #include "game/renderer.h"
 #include "renderer/canary.h"
 #include "renderer/resource_slots.h"
+#include "renderer/shader_tag.h"
 #include "renderer/subrect_fixes.h"
 #include "renderer/mip_bias.h"
 #include "renderer/screen_size_fix.h"
@@ -177,11 +178,15 @@ static HRESULT STDMETHODCALLTYPE hk_create_pixel_shader(ID3D11Device* device, co
                                                         ID3D11ClassLinkage* linkage, ID3D11PixelShader** out) {
     HRESULT hr = o_create_pixel_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
-        resource_slots::tag(*out, code, size);
+        shader_tag::Tag tag;
+        tag.slots = resource_slots::reflect(code, size);
         {
             ScopedInside inside;
-            subrect_fixes::on_create_ps(device, code, size, *out);
+            const subrect_fixes::Shader fix = subrect_fixes::classify_ps(device, code, size);
+            tag.kind = fix.kind;
+            tag.replacement = fix.replacement;
         }
+        shader_tag::set(*out, tag);
         screen_size_fix::Shader f;
         if (screen_size_fix::reflect_ps(code, size, &f)) {
             f.shader = *out;
@@ -208,8 +213,11 @@ static HRESULT STDMETHODCALLTYPE hk_create_vertex_shader(ID3D11Device* device, c
                                                          ID3D11ClassLinkage* linkage, ID3D11VertexShader** out) {
     HRESULT hr = o_create_vertex_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
-        resource_slots::tag(*out, code, size);
-        subrect_fixes::on_create_vs(code, size, *out);
+        shader_tag::Tag tag;
+        tag.slots = resource_slots::reflect(code, size);
+        if (subrect_fixes::is_bloom_vs(code, size))
+            tag.kind = subrect_fixes::Kind::Bloom;
+        shader_tag::set(*out, tag);
         screen_size_fix::Shader f;
         if (screen_size_fix::reflect_vs(code, size, &f)) {
             f.shader = *out;
@@ -261,7 +269,9 @@ static HRESULT STDMETHODCALLTYPE hk_create_compute_shader(ID3D11Device* device, 
                                                           ID3D11ClassLinkage* linkage, ID3D11ComputeShader** out) {
     HRESULT hr = o_create_compute_shader(device, code, size, linkage, out);
     if (SUCCEEDED(hr) && out && *out && !t_inside) {
-        resource_slots::tag(*out, code, size);
+        shader_tag::Tag tag;
+        tag.slots = resource_slots::reflect(code, size);
+        shader_tag::set(*out, tag);
         screen_size_fix::Shader f;
         if (screen_size_fix::reflect_cs(code, size, &f)) {
             f.shader = *out;
@@ -279,7 +289,7 @@ static void STDMETHODCALLTYPE hk_cs_set_shader(ID3D11DeviceContext* ctx, ID3D11C
     if ((cs != g_bound_cs || n != g_cs_classes) && !t_inside) {
         g_bound_cs = cs;
         g_cs_classes = n;
-        g_cs_slots = resource_slots::get(cs, n);
+        g_cs_slots = shader_tag::get(cs, n).slots;
         g_bound_fix_cs = nullptr;
         if (cs) {
             std::lock_guard lock(g_mutex);
@@ -400,8 +410,9 @@ static void STDMETHODCALLTYPE hk_vs_set_shader(ID3D11DeviceContext* ctx, ID3D11V
     if ((vs != g_bound_vs || n != g_vs_classes) && !t_inside) {
         g_bound_vs = vs;
         g_vs_classes = n;
-        g_vs_slots = resource_slots::get(vs, n);
-        g_bound_bloom_vs = subrect_fixes::is_bloom_vs(vs);
+        const shader_tag::Tag tag = shader_tag::get(vs, n);
+        g_vs_slots = tag.slots;
+        g_bound_bloom_vs = tag.kind == subrect_fixes::Kind::Bloom;
         g_bound_fix_vs = nullptr;
         if (vs) {
             std::lock_guard lock(g_mutex);
@@ -420,8 +431,9 @@ static void STDMETHODCALLTYPE hk_ps_set_shader(ID3D11DeviceContext* ctx, ID3D11P
     if ((ps != g_bound_ps || n != g_ps_classes) && !t_inside) {
         g_bound_ps = ps;
         g_ps_classes = n;
-        g_ps_slots = resource_slots::get(ps, n);
-        g_bound_subrect = subrect_fixes::find_ps(ps);
+        const shader_tag::Tag tag = shader_tag::get(ps, n);
+        g_ps_slots = tag.slots;
+        g_bound_subrect = {tag.kind, tag.replacement};
         g_bound_taa = nullptr;
         g_bound_fix = nullptr;
         if (ps) {

@@ -8,7 +8,6 @@
 // Only declared SRV slots can consume padding. Unknown bytecode stays conservative.
 namespace kc::resource_slots {
 inline constexpr uint32_t all = ~uint32_t(0);
-inline constexpr GUID key{0xe217ca02, 0xacaf, 0x4e4d, {0xa2, 0xc3, 0x28, 0xc6, 0x4a, 0x8e, 0x13, 0x92}};
 inline uint32_t reflect(const void* code, SIZE_T size) {
     ID3D11ShaderReflection* r = nullptr;
     if (FAILED(D3DReflect(code, size, __uuidof(ID3D11ShaderReflection), reinterpret_cast<void**>(&r))))
@@ -36,18 +35,6 @@ inline uint32_t reflect(const void* code, SIZE_T size) {
             mask |= uint32_t(1) << slot;
     }
     r->Release();
-    return mask;
-}
-inline void tag(ID3D11DeviceChild* shader, const void* code, SIZE_T size) {
-    uint32_t mask = reflect(code, size);
-    shader->SetPrivateData(key, sizeof(mask), &mask);
-}
-inline uint32_t get(ID3D11DeviceChild* shader, UINT classes = 0) {
-    if (!shader) return 0;
-    if (classes) return all;
-    UINT size = sizeof(uint32_t);
-    uint32_t mask = all;
-    if (FAILED(shader->GetPrivateData(key, &size, &mask)) || size != sizeof(mask)) return all;
     return mask;
 }
 inline UINT count(uint32_t mask) {
