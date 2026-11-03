@@ -85,6 +85,10 @@ void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11Pix
         kind = Kind::Bloom;
     else if (hash_is(code, size, "4006e5a4dbb3eca402502c4ae3cdf9e7"))
         kind = Kind::Caustics;
+    else if (hash_is(code, size, "7f6e903383ed45db5fe3d976914710a2"))
+        kind = Kind::HairOpaqueContact;
+    else if (hash_is(code, size, "c19c94272450fac6642d7abfde00d1b3"))
+        kind = Kind::HairContact;
     if (kind == Kind::None && water_reflection(code, size))
         kind = Kind::WaterReflection;
     if (kind == Kind::None)
@@ -103,6 +107,13 @@ void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11Pix
     } else if (kind == Kind::Contact) {
         std::vector<uint8_t> patched;
         if (!dxbc::patch_contact_depth_uv(code, size, patched))
+            hr = E_FAIL;
+        else
+            hr = device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.replacement);
+    }
+    if (kind == Kind::HairOpaqueContact || kind == Kind::HairContact) {
+        std::vector<uint8_t> patched;
+        if (!dxbc::patch_forward_depth_origins(code, size, patched))
             hr = E_FAIL;
         else
             hr = device->CreatePixelShader(patched.data(), patched.size(), nullptr, &entry.replacement);
@@ -146,9 +157,10 @@ DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader
     }
     if (!shader.replacement)
         return old;
-    if (shader.kind == Kind::Contact) {
+    const bool hair = shader.kind == Kind::HairOpaqueContact || shader.kind == Kind::HairContact;
+    if (shader.kind == Kind::Contact || hair) {
         ComPtr<ID3D11ShaderResourceView> srv;
-        ctx->PSGetShaderResources(0, 1, &srv);
+        ctx->PSGetShaderResources(hair ? (shader.kind == Kind::HairOpaqueContact ? 4 : 6) : 0, 1, &srv);
         if (!srv)
             return old;
         D3D11_SHADER_RESOURCE_VIEW_DESC vd;
@@ -170,9 +182,10 @@ DrawState before_draw(ID3D11DeviceContext* ctx, Shader shader, ID3D11PixelShader
         if (n != 1 || td.SampleDesc.Count != 1 || vp.TopLeftX != 0 || vp.TopLeftY != 0 || vp.Width <= 0 ||
             vp.Height <= 0 || vp.Width > td.Width || vp.Height > td.Height)
             return old;
-        float params[4] = {vp.Width / td.Width, vp.Height / td.Height, 0, 0};
-        if (params[0] >= .999f && params[1] >= .999f)
+        if (vp.Width >= td.Width * .999f && vp.Height >= td.Height * .999f)
             return old;
+        float params[4] = {hair ? float(td.Width) : vp.Width / td.Width,
+                           hair ? float(td.Height) : vp.Height / td.Height, 0, 0};
         ComPtr<ID3D11Device> device;
         ctx->GetDevice(&device);
         if (g_device.Get() != device.Get()) {

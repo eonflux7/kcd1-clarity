@@ -2,7 +2,7 @@
 #include <d3d11.h>
 
 namespace kc::subrect_fixes {
-enum class Kind { None, Stencil, Contact, Bloom, Caustics, WaterReflection };
+enum class Kind { None, Stencil, Contact, Bloom, Caustics, WaterReflection, HairOpaqueContact, HairContact };
 struct Shader {
     Kind kind = Kind::None;
     ID3D11PixelShader* replacement = nullptr;

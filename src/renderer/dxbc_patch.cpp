@@ -168,4 +168,66 @@ bool patch_contact_depth_uv(const void* code, size_t size, std::vector<uint8_t>&
     patched = std::move(out);
     return true;
 }
+
+bool patch_forward_depth_origins(const void* code, size_t size, std::vector<uint8_t>& patched) {
+    patched.clear();
+    const auto* b = static_cast<const uint8_t*>(code);
+    if (!b || size < 32 || size > 1024 * 1024 || std::memcmp(b, "DXBC", 4) || read(b + 24) != size)
+        return false;
+    constexpr uint8_t hashes[2][16] = {
+        {0x7f,0x6e,0x90,0x33,0x83,0xed,0x45,0xdb,0x5f,0xe3,0xd9,0x76,0x91,0x47,0x10,0xa2},
+        {0xc1,0x9c,0x94,0x27,0x24,0x50,0xfa,0xc6,0x64,0x2d,0x7a,0xbf,0xde,0x00,0xd1,0xb3}};
+    const bool opaque = !std::memcmp(b + 4, hashes[0], 16);
+    if (!opaque && std::memcmp(b + 4, hashes[1], 16)) return false;
+    std::vector<uint8_t> verified(b, b + size); checksum(verified);
+    if (std::memcmp(verified.data() + 4, b + 4, 16)) return false;
+    const uint32_t count = read(b + 28);
+    if (!count || count > 64 || 32 + count * 4 > size) return false;
+    // Exact origin instructions. The other PS_ScreenSize multiplies belong to
+    // projected ray steps or tile indexing and must retain their original values.
+    constexpr uint32_t origin[3][8] = {
+        {0x08000038,0x00100032,9,0x00100596,5,0x00208046,0,35},
+        {0x08000038,0x00100032,19,0x00100596,12,0x00208046,0,35},
+        {0x08000038,0x00100062,12,0x00100656,12,0x00208106,0,35}};
+    std::vector<std::vector<uint8_t>> chunks;
+    unsigned programs = 0, edits[3]{};
+    for (uint32_t j = 0; j < count; ++j) {
+        const size_t off = read(b + 32 + j * 4);
+        if (off < 32 + count * 4 || off > size - 8) return false;
+        const size_t len = read(b + off + 4);
+        if (len > size - off - 8) return false;
+        const auto* data = b + off + 8;
+        if (!std::memcmp(b + off,"RDEF",4) || !std::memcmp(b + off,"STAT",4)) continue;
+        std::vector<uint8_t> chunk(b + off,b + off + 8);
+        if (!std::memcmp(b + off,"SHEX",4) || !std::memcmp(b + off,"SHDR",4)) {
+            if (++programs != 1 || len < 8 || len % 4 || read(data + 4) != len / 4) return false;
+            std::vector<uint8_t> words(data,data + 8);
+            bool declared = false;
+            for (size_t i = 2; i < len / 4;) {
+                const uint32_t token = read(data+i*4), op = token & 2047, n = (token >> 24) & 127;
+                if (!n || i+n > len/4) return false;
+                if (op == 89 && n >= 4 && read(data+(i+2)*4) == 13) return false;
+                if (!declared && op == 90) {
+                    for (auto v : {0x04000059u,0x00208e46u,13u,1u}) append(words,v);
+                    declared = true;
+                }
+                const size_t start = words.size();
+                words.insert(words.end(),data+i*4,data+(i+n)*4);
+                for (unsigned k = opaque ? 0 : 1; k < (opaque ? 1u : 3u); ++k)
+                    if (n == 8 && !std::memcmp(data+i*4,origin[k],sizeof(origin[k]))) {
+                        store(words,start+6*4,13); store(words,start+7*4,0); ++edits[k];
+                    }
+                i += n;
+            }
+            if (!declared) return false;
+            store(words,4,uint32_t(words.size()/4));
+            chunk.insert(chunk.end(),words.begin(),words.end());store(chunk,4,uint32_t(words.size()));
+        } else chunk.insert(chunk.end(),data,data+len);
+        chunks.push_back(std::move(chunk));
+    }
+    if (programs != 1 || (opaque ? (edits[0]!=1 || edits[1] || edits[2]) : (edits[0] || edits[1]!=1 || edits[2]!=1))) return false;
+    std::vector<uint8_t> out(b,b+32);store(out,28,uint32_t(chunks.size()));out.resize(32+4*chunks.size());
+    for (size_t i=0;i<chunks.size();++i) {store(out,32+i*4,uint32_t(out.size()));out.insert(out.end(),chunks[i].begin(),chunks[i].end());}
+    store(out,24,uint32_t(out.size()));checksum(out);patched=std::move(out);return true;
+}
 } // namespace kc::dxbc
