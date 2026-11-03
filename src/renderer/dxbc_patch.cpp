@@ -85,36 +85,44 @@ void checksum(std::vector<uint8_t>& blob) {
     }
     std::memcpy(blob.data() + 4, state, sizeof(state));
 }
-} // namespace
 
-bool patch_contact_depth_uv(const void* code, size_t size, std::vector<uint8_t>& patched) {
-    patched.clear();
-    const auto* b = static_cast<const uint8_t*>(code);
+using Hash = uint8_t[16];
+
+// Returns the index of the known shader checksum `code` carries, or -1. Fails closed on a
+// malformed container or a damaged shader instead of trusting its advertised checksum.
+int match_shader(const uint8_t* b, size_t size, const Hash* hashes, size_t count) {
     if (!b || size < 32 || size > 1024 * 1024 || std::memcmp(b, "DXBC", 4) || read(b + 24) != size)
-        return false;
-    constexpr uint8_t hashes[2][16] = {
-        {0x5e, 0x3a, 0x6a, 0xd3, 0x50, 0x9e, 0x43, 0x3d, 0x1d, 0x3c, 0x8d, 0xb2, 0x83, 0x92, 0x2c, 0x29},
-        {0xe1, 0x08, 0xb1, 0x8f, 0xda, 0xe5, 0x60, 0x7b, 0xc3, 0x14, 0x4b, 0x28, 0xe6, 0xd0, 0xc1, 0xf4}};
-    if (std::memcmp(b + 4, hashes[0], 16) && std::memcmp(b + 4, hashes[1], 16))
-        return false;
-    // Fail closed on a damaged shader instead of trusting its advertised checksum.
+        return -1;
+    int match = -1;
+    for (size_t i = 0; i < count && match < 0; ++i)
+        if (!std::memcmp(b + 4, hashes[i], 16))
+            match = int(i);
+    if (match < 0)
+        return -1;
     std::vector<uint8_t> verified(b, b + size);
     checksum(verified);
     if (std::memcmp(verified.data() + 4, b + 4, 16))
-        return false;
-    uint32_t count = read(b + 28);
+        return -1;
+    return match;
+}
+
+// Rebuilds a container with exactly one shader program. RDEF and STAT are dropped,
+// and a b13 constant buffer declaration is inserted before dcl_temps. `edit` receives
+// every original instruction (op, word count) and appends its replacement to `words`;
+// it returns false to reject the shader. The output checksum is recomputed.
+template <class Edit>
+bool rewrite_program(const uint8_t* b, size_t size, Edit&& edit, std::vector<uint8_t>& patched) {
+    patched.clear();
+    const uint32_t count = read(b + 28);
     if (!count || count > 64 || 32 + count * 4 > size)
         return false;
     std::vector<std::vector<uint8_t>> chunks;
-    unsigned samples = 0, programs = 0;
-    constexpr uint32_t sample[] = {0x8d000048, 0x800000c2, 0x00155543, 0x00100012, 5,          0x00100086, 6,
-                                   0x00107e46, 0,          0x00106000, 0,          0x00004001, 0};
-    constexpr uint32_t mul[] = {0x08000038, 0x00100052, 6, 0x00100a06, 6, 0x00208506, 13, 0};
+    unsigned programs = 0;
     for (uint32_t j = 0; j < count; ++j) {
-        size_t off = read(b + 32 + j * 4);
+        const size_t off = read(b + 32 + j * 4);
         if (off < 32 + count * 4 || off > size - 8)
             return false;
-        size_t len = read(b + off + 4);
+        const size_t len = read(b + off + 4);
         if (len > size - off - 8)
             return false;
         const uint8_t* data = b + off + 8;
@@ -127,7 +135,7 @@ bool patch_contact_depth_uv(const void* code, size_t size, std::vector<uint8_t>&
             std::vector<uint8_t> words(data, data + 8);
             bool declared = false;
             for (size_t i = 2; i < len / 4;) {
-                uint32_t token = read(data + i * 4), op = token & 2047, n = (token >> 24) & 127;
+                const uint32_t token = read(data + i * 4), op = token & 2047, n = (token >> 24) & 127;
                 if (!n || i + n > len / 4)
                     return false;
                 if (!declared && op == 90) {
@@ -135,14 +143,8 @@ bool patch_contact_depth_uv(const void* code, size_t size, std::vector<uint8_t>&
                         append(words, v);
                     declared = true;
                 }
-                if (op == 72) {
-                    if (n != std::size(sample) || std::memcmp(data + i * 4, sample, sizeof(sample)))
-                        return false;
-                    for (auto v : mul)
-                        append(words, v);
-                    ++samples;
-                }
-                words.insert(words.end(), data + i * 4, data + (i + n) * 4);
+                if (!edit(data + i * 4, op, n, words))
+                    return false;
                 i += n;
             }
             if (!declared)
@@ -150,11 +152,12 @@ bool patch_contact_depth_uv(const void* code, size_t size, std::vector<uint8_t>&
             store(words, 4, uint32_t(words.size() / 4));
             chunk.insert(chunk.end(), words.begin(), words.end());
             store(chunk, 4, uint32_t(words.size()));
-        } else
+        } else {
             chunk.insert(chunk.end(), data, data + len);
+        }
         chunks.push_back(std::move(chunk));
     }
-    if (samples != 1 || programs != 1)
+    if (programs != 1)
         return false;
     std::vector<uint8_t> out(b, b + 32);
     store(out, 28, uint32_t(chunks.size()));
@@ -168,66 +171,80 @@ bool patch_contact_depth_uv(const void* code, size_t size, std::vector<uint8_t>&
     patched = std::move(out);
     return true;
 }
+} // namespace
+
+bool patch_contact_depth_uv(const void* code, size_t size, std::vector<uint8_t>& patched) {
+    patched.clear();
+    const auto* b = static_cast<const uint8_t*>(code);
+    constexpr Hash hashes[] = {
+        {0x5e, 0x3a, 0x6a, 0xd3, 0x50, 0x9e, 0x43, 0x3d, 0x1d, 0x3c, 0x8d, 0xb2, 0x83, 0x92, 0x2c, 0x29},
+        {0xe1, 0x08, 0xb1, 0x8f, 0xda, 0xe5, 0x60, 0x7b, 0xc3, 0x14, 0x4b, 0x28, 0xe6, 0xd0, 0xc1, 0xf4}};
+    if (match_shader(b, size, hashes, std::size(hashes)) < 0)
+        return false;
+    constexpr uint32_t sample[] = {0x8d000048, 0x800000c2, 0x00155543, 0x00100012, 5,          0x00100086, 6,
+                                   0x00107e46, 0,          0x00106000, 0,          0x00004001, 0};
+    constexpr uint32_t mul[] = {0x08000038, 0x00100052, 6, 0x00100a06, 6, 0x00208506, 13, 0};
+    unsigned samples = 0;
+    auto edit = [&](const uint8_t* instr, uint32_t op, uint32_t n, std::vector<uint8_t>& words) {
+        if (op == 72) {
+            if (n != std::size(sample) || std::memcmp(instr, sample, sizeof(sample)))
+                return false;
+            for (auto v : mul)
+                append(words, v);
+            ++samples;
+        }
+        words.insert(words.end(), instr, instr + n * 4);
+        return true;
+    };
+    std::vector<uint8_t> out;
+    if (!rewrite_program(b, size, edit, out) || samples != 1)
+        return false;
+    patched = std::move(out);
+    return true;
+}
 
 bool patch_forward_depth_origins(const void* code, size_t size, std::vector<uint8_t>& patched) {
     patched.clear();
     const auto* b = static_cast<const uint8_t*>(code);
-    if (!b || size < 32 || size > 1024 * 1024 || std::memcmp(b, "DXBC", 4) || read(b + 24) != size)
+    constexpr Hash hashes[] = {
+        {0x7f, 0x6e, 0x90, 0x33, 0x83, 0xed, 0x45, 0xdb, 0x5f, 0xe3, 0xd9, 0x76, 0x91, 0x47, 0x10, 0xa2},
+        {0xc1, 0x9c, 0x94, 0x27, 0x24, 0x50, 0xfa, 0xc6, 0x64, 0x2d, 0x7a, 0xbf, 0xde, 0x00, 0xd1, 0xb3}};
+    const int match = match_shader(b, size, hashes, std::size(hashes));
+    if (match < 0)
         return false;
-    constexpr uint8_t hashes[2][16] = {
-        {0x7f,0x6e,0x90,0x33,0x83,0xed,0x45,0xdb,0x5f,0xe3,0xd9,0x76,0x91,0x47,0x10,0xa2},
-        {0xc1,0x9c,0x94,0x27,0x24,0x50,0xfa,0xc6,0x64,0x2d,0x7a,0xbf,0xde,0x00,0xd1,0xb3}};
-    const bool opaque = !std::memcmp(b + 4, hashes[0], 16);
-    if (!opaque && std::memcmp(b + 4, hashes[1], 16)) return false;
-    std::vector<uint8_t> verified(b, b + size); checksum(verified);
-    if (std::memcmp(verified.data() + 4, b + 4, 16)) return false;
-    const uint32_t count = read(b + 28);
-    if (!count || count > 64 || 32 + count * 4 > size) return false;
+    const bool opaque = match == 0;
     // Exact origin instructions. The other PS_ScreenSize multiplies belong to
     // projected ray steps or tile indexing and must retain their original values.
     constexpr uint32_t origin[3][8] = {
-        {0x08000038,0x00100032,9,0x00100596,5,0x00208046,0,35},
-        {0x08000038,0x00100032,19,0x00100596,12,0x00208046,0,35},
-        {0x08000038,0x00100062,12,0x00100656,12,0x00208106,0,35}};
-    std::vector<std::vector<uint8_t>> chunks;
-    unsigned programs = 0, edits[3]{};
-    for (uint32_t j = 0; j < count; ++j) {
-        const size_t off = read(b + 32 + j * 4);
-        if (off < 32 + count * 4 || off > size - 8) return false;
-        const size_t len = read(b + off + 4);
-        if (len > size - off - 8) return false;
-        const auto* data = b + off + 8;
-        if (!std::memcmp(b + off,"RDEF",4) || !std::memcmp(b + off,"STAT",4)) continue;
-        std::vector<uint8_t> chunk(b + off,b + off + 8);
-        if (!std::memcmp(b + off,"SHEX",4) || !std::memcmp(b + off,"SHDR",4)) {
-            if (++programs != 1 || len < 8 || len % 4 || read(data + 4) != len / 4) return false;
-            std::vector<uint8_t> words(data,data + 8);
-            bool declared = false;
-            for (size_t i = 2; i < len / 4;) {
-                const uint32_t token = read(data+i*4), op = token & 2047, n = (token >> 24) & 127;
-                if (!n || i+n > len/4) return false;
-                if (op == 89 && n >= 4 && read(data+(i+2)*4) == 13) return false;
-                if (!declared && op == 90) {
-                    for (auto v : {0x04000059u,0x00208e46u,13u,1u}) append(words,v);
-                    declared = true;
-                }
-                const size_t start = words.size();
-                words.insert(words.end(),data+i*4,data+(i+n)*4);
-                for (unsigned k = opaque ? 0 : 1; k < (opaque ? 1u : 3u); ++k)
-                    if (n == 8 && !std::memcmp(data+i*4,origin[k],sizeof(origin[k]))) {
-                        store(words,start+6*4,13); store(words,start+7*4,0); ++edits[k];
-                    }
-                i += n;
+        {0x08000038, 0x00100032, 9, 0x00100596, 5, 0x00208046, 0, 35},
+        {0x08000038, 0x00100032, 19, 0x00100596, 12, 0x00208046, 0, 35},
+        {0x08000038, 0x00100062, 12, 0x00100656, 12, 0x00208106, 0, 35}};
+    // The opaque variant has origin 0; the transparent variant has origins 1 and 2.
+    const unsigned first = opaque ? 0 : 1, last = opaque ? 1 : 3;
+    unsigned edits[3]{};
+    auto edit = [&](const uint8_t* instr, uint32_t op, uint32_t n, std::vector<uint8_t>& words) {
+        // b13 must be free for the allocation dimensions.
+        if (op == 89 && n >= 4 && read(instr + 2 * 4) == 13)
+            return false;
+        const size_t start = words.size();
+        words.insert(words.end(), instr, instr + n * 4);
+        for (unsigned k = first; k < last; ++k)
+            if (n == 8 && !std::memcmp(instr, origin[k], sizeof(origin[k]))) {
+                // Redirect the PS_ScreenSize operand (cb0[35]) to cb13[0].
+                store(words, start + 6 * 4, 13);
+                store(words, start + 7 * 4, 0);
+                ++edits[k];
             }
-            if (!declared) return false;
-            store(words,4,uint32_t(words.size()/4));
-            chunk.insert(chunk.end(),words.begin(),words.end());store(chunk,4,uint32_t(words.size()));
-        } else chunk.insert(chunk.end(),data,data+len);
-        chunks.push_back(std::move(chunk));
-    }
-    if (programs != 1 || (opaque ? (edits[0]!=1 || edits[1] || edits[2]) : (edits[0] || edits[1]!=1 || edits[2]!=1))) return false;
-    std::vector<uint8_t> out(b,b+32);store(out,28,uint32_t(chunks.size()));out.resize(32+4*chunks.size());
-    for (size_t i=0;i<chunks.size();++i) {store(out,32+i*4,uint32_t(out.size()));out.insert(out.end(),chunks[i].begin(),chunks[i].end());}
-    store(out,24,uint32_t(out.size()));checksum(out);patched=std::move(out);return true;
+        return true;
+    };
+    std::vector<uint8_t> out;
+    if (!rewrite_program(b, size, edit, out))
+        return false;
+    const bool expected = opaque ? edits[0] == 1 && !edits[1] && !edits[2]
+                                 : !edits[0] && edits[1] == 1 && edits[2] == 1;
+    if (!expected)
+        return false;
+    patched = std::move(out);
+    return true;
 }
 } // namespace kc::dxbc

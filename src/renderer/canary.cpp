@@ -49,10 +49,14 @@ static std::unordered_map<ID3D11ShaderResourceView*, Input> g_inputs;
 static std::vector<ID3D11Resource*> g_full_layout;
 // Water reflection history survives Present and alternates between two textures.
 // Pin identities and retain the last producer's actual rectangle until a new write.
-struct BottomTarget { ID3D11Resource* resource; UINT width, height; };
+struct BottomTarget {
+    ID3D11Resource* resource;
+    UINT width, height;
+};
 static std::vector<BottomTarget> g_bottom_targets;
 static void clear_bottom_targets() {
-    for (auto& t : g_bottom_targets) t.resource->Release();
+    for (auto& t : g_bottom_targets)
+        t.resource->Release();
     g_bottom_targets.clear();
 }
 static void forget_bottom_target(ID3D11Resource* resource) {
@@ -65,23 +69,40 @@ static void forget_bottom_target(ID3D11Resource* resource) {
 }
 void record_bottom_target(ID3D11DeviceContext* ctx) {
     const auto& s = taa_dlss::settings();
-    if (s.mode != taa_dlss::Mode::Dlss || s.render_scale >= .999f) return;
+    if (s.mode != taa_dlss::Mode::Dlss || s.render_scale >= .999f)
+        return;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rt;
     ctx->OMGetRenderTargets(1, &rt, nullptr);
-    if (!rt) return;
-    D3D11_RENDER_TARGET_VIEW_DESC vd{}; rt->GetDesc(&vd);
-    if (vd.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || vd.Texture2D.MipSlice != 0) return;
-    Microsoft::WRL::ComPtr<ID3D11Resource> resource; rt->GetResource(&resource);
-    D3D11_RESOURCE_DIMENSION dimension; resource->GetType(&dimension);
-    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return;
-    D3D11_TEXTURE2D_DESC td{}; static_cast<ID3D11Texture2D*>(resource.Get())->GetDesc(&td);
-    D3D11_VIEWPORT vp{}; UINT n = 1; ctx->RSGetViewports(&n, &vp);
-    auto d = game::current_downscale();
-    UINT w = UINT(floorf(float(td.Width) * d.x + .05f));
-    UINT h = UINT(floorf(float(td.Height) * d.y + .05f));
-    if (n != 1 || td.ArraySize != 1 || td.SampleDesc.Count != 1 || !w || !h ||
-        w > td.Width || h >= td.Height || vp.TopLeftX != 0 || vp.TopLeftY != float(td.Height-h) ||
-        vp.Width != float(w) || vp.Height != float(h)) return;
+    if (!rt)
+        return;
+    D3D11_RENDER_TARGET_VIEW_DESC vd{};
+    rt->GetDesc(&vd);
+    if (vd.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || vd.Texture2D.MipSlice != 0)
+        return;
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+    rt->GetResource(&resource);
+    D3D11_RESOURCE_DIMENSION dimension;
+    resource->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        return;
+    D3D11_TEXTURE2D_DESC td{};
+    static_cast<ID3D11Texture2D*>(resource.Get())->GetDesc(&td);
+    if (td.ArraySize != 1 || td.SampleDesc.Count != 1)
+        return;
+
+    // The producer renders the scaled image into the bottom-left corner of the allocation.
+    const auto d = game::current_downscale();
+    const UINT w = UINT(floorf(float(td.Width) * d.x + .05f));
+    const UINT h = UINT(floorf(float(td.Height) * d.y + .05f));
+    if (!w || !h || w > td.Width || h >= td.Height)
+        return;
+    D3D11_VIEWPORT vp{};
+    UINT n = 1;
+    ctx->RSGetViewports(&n, &vp);
+    if (n != 1 || vp.TopLeftX != 0 || vp.TopLeftY != float(td.Height - h) || vp.Width != float(w) ||
+        vp.Height != float(h))
+        return;
+
     forget_bottom_target(resource.Get());
     g_bottom_targets.push_back({resource.Detach(), w, h});
 }
