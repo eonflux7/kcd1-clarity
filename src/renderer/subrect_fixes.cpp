@@ -37,6 +37,34 @@ bool hash_is(const void* code, SIZE_T size, const char* hash) {
             return false;
     return true;
 }
+// Match the reflection producer by used reflection bindings, independent of material permutations.
+bool water_reflection(const void* code, SIZE_T size) {
+    const auto* bytes = static_cast<const char*>(code);
+    constexpr char name[] = "ReflSamplerPrev";
+    bool candidate = false;
+    for (SIZE_T i = 0; i + sizeof(name) <= size; ++i)
+        if (!std::memcmp(bytes+i, name, sizeof(name))) { candidate = true; break; }
+    if (!candidate) return false;
+    ComPtr<ID3D11ShaderReflection> r;
+    if (FAILED(D3DReflect(code, size, __uuidof(ID3D11ShaderReflection), reinterpret_cast<void**>(r.GetAddressOf())))) return false;
+    D3D11_SHADER_DESC desc{}; r->GetDesc(&desc);
+    // CryEngine retains identical names for the sampler and texture entries.
+    for (const char* texture : {"ReflSamplerPrev", "sceneDepthSamplerScaled"}) {
+        bool found = false;
+        for (UINT i = 0; i < desc.BoundResources; ++i) {
+            D3D11_SHADER_INPUT_BIND_DESC d{};
+            if (SUCCEEDED(r->GetResourceBindingDesc(i, &d)) && d.Type == D3D_SIT_TEXTURE &&
+                d.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && !std::strcmp(d.Name, texture)) found = true;
+        }
+        if (!found) return false;
+    }
+    for (UINT i = 0; i < desc.ConstantBuffers; ++i) {
+        auto* var = r->GetConstantBufferByIndex(i)->GetVariableByName("mViewProjPrev");
+        D3D11_SHADER_VARIABLE_DESC d{};
+        if (SUCCEEDED(var->GetDesc(&d)) && (d.uFlags & D3D_SVF_USED)) return true;
+    }
+    return false;
+}
 constexpr char kStencil[] = R"(
 Texture2D<uint2> StencilTex : register(t4);
 float4 main(float4 p : SV_Position) : SV_Target {
@@ -57,6 +85,8 @@ void on_create_ps(ID3D11Device* device, const void* code, SIZE_T size, ID3D11Pix
         kind = Kind::Bloom;
     else if (hash_is(code, size, "4006e5a4dbb3eca402502c4ae3cdf9e7"))
         kind = Kind::Caustics;
+    if (kind == Kind::None && water_reflection(code, size))
+        kind = Kind::WaterReflection;
     if (kind == Kind::None)
         return;
     Entry entry{};

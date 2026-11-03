@@ -322,6 +322,7 @@ class SubrectDraw {
     explicit SubrectDraw(ID3D11DeviceContext* ctx) : ctx_(ctx), active_(!t_inside) {
         if (!active_)
             return;
+        water_ = g_bound_subrect.kind == subrect_fixes::Kind::WaterReflection;
         bloom_ = g_bound_subrect.kind == subrect_fixes::Kind::Bloom && g_bound_bloom_vs;
         ScopedInside inside;
         state_ = subrect_fixes::before_draw(ctx, g_bound_subrect, g_bound_ps);
@@ -333,13 +334,15 @@ class SubrectDraw {
         subrect_fixes::after_draw(ctx_, state_);
         if (bloom_)
             canary::preserve_full_target(ctx_);
+        if (water_)
+            canary::record_bottom_target(ctx_);
     }
     SubrectDraw(const SubrectDraw&) = delete;
     SubrectDraw& operator=(const SubrectDraw&) = delete;
 
   private:
     ID3D11DeviceContext* ctx_;
-    bool active_, bloom_ = false;
+    bool active_, bloom_ = false, water_ = false;
     subrect_fixes::DrawState state_;
 };
 

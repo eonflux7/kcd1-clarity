@@ -7,6 +7,7 @@
 // outside the sub-rect, the class behind the SSS feedback loop, the bloom haze, the SSDO/SVO right-edge glow.
 //
 // Full-layout bloom is tracked explicitly and excluded from sub-rect fills.
+// Water reflection rectangles are tracked from their producer viewport.
 // The invariant for other screen buffers is "every screen buffer holds the current frame in its top-left
 // (scale x scale) part"; what lies outside is stale and no correct pass reads it. While the frame is
 // downscaled, before every draw and dispatch up to the TAA draw (inclusive), the outside region of each bound
@@ -65,6 +66,8 @@ void before_draw(ID3D11DeviceContext* ctx, DrawFn draw, uint32_t vs_slots = ~uin
 void before_dispatch(ID3D11DeviceContext* ctx, DrawFn draw, uint32_t cs_slots = ~uint32_t(0));
 // A recognized bloom draw filled an entire target. Do not pad/poison this resource.
 void preserve_full_target(ID3D11DeviceContext* ctx);
+// A recognized water reflection draw writes a bottom-left rectangle (including history).
+void record_bottom_target(ID3D11DeviceContext* ctx);
 // Render thread: these targets are about to be written (OMSetRenderTargets) / were written (dispatch UAVs).
 void on_set_targets(UINT n, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv);
 void on_set_uavs(UINT n, ID3D11UnorderedAccessView* const* uavs);
