@@ -583,6 +583,47 @@ static ID3D11DeviceContext1* ctx1(ID3D11DeviceContext* ctx, ID3D11Device* device
     return g_ctx1;
 }
 
+// The water reflection's bottom-left layout (record_bottom_target) is read in two places. The water surface (WaterPS)
+// reads it at its pixel plus the waves' offset, and the offset also carries the shift into the bottom sub-rect
+// (reflTC.y = 1 - (1 - y) * PS_HPosScale.y); where the offset would land on something in front of the water (a post,
+// a railing) the shader drops it (fReflMask) and reads the unshifted place: the top-left twin of the sub-rect, which
+// the clamp padding fills with the sub-rect's top row stretched up (the far water's colours): dark wave-shaped fringes
+// around everything standing in the water's view. The sub-rect itself is copied there (through a scratch texture: a
+// copy within one subresource is not allowed).
+struct TwinScratch {
+    ID3D11Texture2D* tex;
+    DXGI_FORMAT format;
+    UINT w, h;
+};
+static std::vector<TwinScratch> g_twin_scratch;
+static void copy_bottom_twin(ID3D11DeviceContext* ctx, ID3D11Device* device, ID3D11Resource* res,
+                             const D3D11_TEXTURE2D_DESC& td, UINT mip, UINT mh, UINT sw, UINT sh) {
+    if (sw == 0 || sh == 0 || mh < 2 * sh)
+        return;
+    auto it = std::find_if(g_twin_scratch.begin(), g_twin_scratch.end(), [&](const TwinScratch& t) {
+        return t.format == td.Format && t.w >= sw && t.h >= sh;
+    });
+    if (it == g_twin_scratch.end()) {
+        D3D11_TEXTURE2D_DESC d = {};
+        d.Width = sw;
+        d.Height = sh;
+        d.MipLevels = d.ArraySize = 1;
+        d.Format = td.Format;
+        d.SampleDesc.Count = 1;
+        ID3D11Texture2D* t = nullptr;
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &t)))
+            return;
+        g_twin_scratch.push_back({t, td.Format, sw, sh});
+        it = g_twin_scratch.end() - 1;
+        logf("canary: water reflection %ux%u: its sub-rect copied into the top-left twin (%ux%u)", td.Width,
+             td.Height, sw, sh);
+    }
+    const UINT sub = D3D11CalcSubresource(mip, 0, td.MipLevels);
+    const D3D11_BOX src = {0, mh - sh, 0, sw, mh, 1}, back = {0, 0, 0, sw, sh, 1};
+    ctx->CopySubresourceRegion(it->tex, 0, 0, 0, 0, res, sub, &src);
+    ctx->CopySubresourceRegion(res, sub, 0, 0, 0, it->tex, 0, &back);
+}
+
 // Fills mip `mip` (mw x mh) of res outside its sub-rect (sw x sh). False if it could not.
 static bool fill(ID3D11DeviceContext* ctx, ID3D11Device* device, ID3D11Resource* res, const D3D11_TEXTURE2D_DESC& td,
                  DXGI_FORMAT format, UINT mip, UINT mw, UINT mh, UINT sw, UINT sh, DrawFn draw, bool bottom) {
@@ -710,6 +751,9 @@ static void fill_inputs(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* cons
                 ++g_frame.skipped;
                 continue;
             }
+            // Canary mode leaves the twin coloured: it shows where the shader reads outside the sub-rect.
+            if (bottom && g_status.clamping)
+                copy_bottom_twin(ctx, device, res, td, m, mh, sw, sh);
             ++g_frame.fills;
             if (g_textures.insert(res).second)
                 ++g_frame.textures;
