@@ -88,30 +88,34 @@ void checksum(std::vector<uint8_t>& blob) {
 
 using Hash = uint8_t[16];
 
+// A well-formed container whose checksum matches its content.
+bool verified(const uint8_t* b, size_t size) {
+    if (!b || size < 32 || size > 1024 * 1024 || std::memcmp(b, "DXBC", 4) || read(b + 24) != size)
+        return false;
+    std::vector<uint8_t> copy(b, b + size);
+    checksum(copy);
+    return !std::memcmp(copy.data() + 4, b + 4, 16);
+}
+
 // Returns the index of the known shader checksum `code` carries, or -1. Fails closed on a
 // malformed container or a damaged shader instead of trusting its advertised checksum.
 int match_shader(const uint8_t* b, size_t size, const Hash* hashes, size_t count) {
-    if (!b || size < 32 || size > 1024 * 1024 || std::memcmp(b, "DXBC", 4) || read(b + 24) != size)
+    if (!b || size < 32)
         return -1;
     int match = -1;
     for (size_t i = 0; i < count && match < 0; ++i)
         if (!std::memcmp(b + 4, hashes[i], 16))
             match = int(i);
-    if (match < 0)
-        return -1;
-    std::vector<uint8_t> verified(b, b + size);
-    checksum(verified);
-    if (std::memcmp(verified.data() + 4, b + 4, 16))
-        return -1;
-    return match;
+    return match >= 0 && verified(b, size) ? match : -1;
 }
 
 // Rebuilds a container with exactly one shader program. RDEF and STAT are dropped,
-// and a b13 constant buffer declaration is inserted before dcl_temps. `edit` receives
-// every original instruction (op, word count) and appends its replacement to `words`;
+// and (with declare_b13) a b13 constant buffer declaration is inserted before dcl_temps. `edit`
+// receives every original instruction (op, word count) and appends its replacement to `words`;
 // it returns false to reject the shader. The output checksum is recomputed.
 template <class Edit>
-bool rewrite_program(const uint8_t* b, size_t size, Edit&& edit, std::vector<uint8_t>& patched) {
+bool rewrite_program(const uint8_t* b, size_t size, Edit&& edit, std::vector<uint8_t>& patched,
+                     bool declare_b13 = true) {
     patched.clear();
     const uint32_t count = read(b + 28);
     if (!count || count > 64 || 32 + count * 4 > size)
@@ -133,7 +137,7 @@ bool rewrite_program(const uint8_t* b, size_t size, Edit&& edit, std::vector<uin
             if (++programs != 1 || len < 8 || len % 4 || read(data + 4) != len / 4)
                 return false;
             std::vector<uint8_t> words(data, data + 8);
-            bool declared = false;
+            bool declared = !declare_b13;
             for (size_t i = 2; i < len / 4;) {
                 const uint32_t token = read(data + i * 4), op = token & 2047, n = (token >> 24) & 127;
                 if (!n || i + n > len / 4)
@@ -243,6 +247,234 @@ bool patch_forward_depth_origins(const void* code, size_t size, std::vector<uint
     const bool expected = opaque ? edits[0] == 1 && !edits[1] && !edits[2]
                                  : !edits[0] && edits[1] == 1 && edits[2] == 1;
     if (!expected)
+        return false;
+    patched = std::move(out);
+    return true;
+}
+
+namespace {
+// One operand of an instruction: register type, component selection and immediate indices.
+// Only the forms the water patch has to recognise are accepted; anything else fails parsing.
+struct Operand {
+    uint32_t type = 0, mode = 0, bits = 0;  // bits: mask (mode 0), swizzle (1) or component (2)
+    bool neg = false;
+    uint32_t index[2] = {};
+    size_t words = 0;
+    uint32_t imm = 0;  // immediate32 with one component
+};
+enum : uint32_t { kTemp = 0, kImmediate = 4, kResource = 7, kConstantBuffer = 8 };
+bool parse_operand(const uint8_t* p, size_t avail, Operand& o) {
+    if (avail < 1)
+        return false;
+    const uint32_t t = read(p);
+    o = {};
+    o.mode = (t >> 2) & 3;
+    o.bits = (t >> 4) & 255;
+    o.type = (t >> 12) & 255;
+    const uint32_t dims = (t >> 20) & 3;
+    size_t at = 1;
+    if (t >> 31) {
+        // Only a plain negate modifier.
+        if (avail < 2 || (read(p + 4) & 0x80003fffu) != 0x41u)
+            return false;
+        o.neg = true;
+        at = 2;
+    }
+    if (o.type == kImmediate) {
+        if ((t & 3) != 1 || dims || at + 1 > avail)
+            return false;
+        o.imm = read(p + at * 4);
+        o.words = at + 1;
+        return true;
+    }
+    if (dims > 2 || at + dims > avail)
+        return false;
+    for (uint32_t d = 0; d < dims; ++d) {
+        if ((t >> (22 + 3 * d)) & 7)  // relative addressing
+            return false;
+        o.index[d] = read(p + (at + d) * 4);
+    }
+    o.words = at + dims;
+    return true;
+}
+// An ALU or sample instruction with one destination (operand 0) and only plain operands:
+// the instructions a backward search for a register's last writer may step over.
+bool single_destination(uint32_t op) {
+    switch (op) {
+    case 0: case 1: case 11: case 12: case 14: case 15: case 16: case 17: case 24: case 25: case 26: case 27:
+    case 28: case 29: case 30: case 43: case 47: case 49: case 50: case 51: case 52: case 54: case 55: case 56:
+    case 57: case 59: case 60: case 64: case 65: case 66: case 67: case 68: case 69: case 70: case 71: case 72:
+    case 73: case 74: case 75: case 86:
+        return true;
+    default:
+        return false;
+    }
+}
+struct Instr {
+    const uint8_t* p;
+    uint32_t op, n;
+    // Operands start after the opcode token and any extended opcode tokens.
+    size_t first_operand() const {
+        size_t at = 1;
+        for (uint32_t t = read(p); (t >> 31) && at < n; ++at)
+            t = read(p + at * 4);
+        return at;
+    }
+    bool operands(Operand* out, size_t count) const {
+        size_t at = first_operand();
+        for (size_t i = 0; i < count; ++i) {
+            if (at >= n || !parse_operand(p + at * 4, n - at, out[i]))
+                return false;
+            at += out[i].words;
+        }
+        return true;
+    }
+};
+} // namespace
+
+// WaterPS reads its reflection at  uv + offset * mask,  where the offset's y also carries the
+// shift into the bottom-left sub-rect, 1 - (1 - y) * PS_HPosScale.y, and mask (0 or 1) drops
+// the offset where it would land on something in front of the water. A dropped read lands at
+// the unshifted uv. The reflection sample is moved to a new temp register holding
+//   x = coordinate.x,  y = coordinate.y + (1 - mask) * (1 - PS_HPosScale.y)
+// so the dropped reads are shifted too. Original registers are left untouched.
+bool patch_water_refl_fallback(const void* code, size_t size, unsigned refl_slot, unsigned hpos_cb,
+                               unsigned hpos_vec, std::vector<uint8_t>& patched) {
+    patched.clear();
+    const auto* b = static_cast<const uint8_t*>(code);
+    if (!verified(b, size))
+        return false;
+    // The program's instructions.
+    std::vector<Instr> code_;
+    const uint32_t count = read(b + 28);
+    if (!count || count > 64 || 32 + count * 4 > size)
+        return false;
+    for (uint32_t j = 0; j < count; ++j) {
+        const size_t off = read(b + 32 + j * 4);
+        if (off < 32 + count * 4 || off > size - 8)
+            return false;
+        const size_t len = read(b + off + 4);
+        if (len > size - off - 8 || (std::memcmp(b + off, "SHEX", 4) && std::memcmp(b + off, "SHDR", 4)))
+            continue;
+        if (!code_.empty() || len < 8 || len % 4)
+            return false;
+        const uint8_t* data = b + off + 8;
+        for (size_t i = 2; i < len / 4;) {
+            const uint32_t token = read(data + i * 4), op = token & 2047, n = (token >> 24) & 127;
+            if (!n || i + n > len / 4)
+                return false;
+            code_.push_back({data + i * 4, op, n});
+            i += n;
+        }
+    }
+    // dcl_temps: the new register's index.
+    size_t temps = code_.size();
+    for (size_t i = 0; i < code_.size(); ++i)
+        if (code_[i].op == 104) {
+            if (temps != code_.size() || code_[i].n != 2)
+                return false;
+            temps = i;
+        }
+    if (temps == code_.size())
+        return false;
+    const uint32_t reg = read(code_[temps].p + 4);
+    // The first (and only) sample of the reflection texture.
+    size_t s = code_.size();
+    Operand so[3];
+    for (size_t i = 0; i < code_.size(); ++i) {
+        if (code_[i].op < 69 || code_[i].op > 74 || !code_[i].operands(so, 3) || so[2].type != kResource ||
+            so[2].index[0] != refl_slot)
+            continue;
+        if (s != code_.size())
+            return false;
+        s = i;
+    }
+    if (s == code_.size() || s == 0 || !code_[s].operands(so, 3))
+        return false;
+    const Operand& coord = so[1];
+    if (coord.type != kTemp || coord.mode != 1 || coord.neg || coord.words != 2)
+        return false;
+    const uint32_t cx = coord.bits & 3, cy = (coord.bits >> 2) & 3;
+    // The index of the last writer of temp r component c before `before`, stepping over
+    // single-destination instructions only; npos if anything else is in the way.
+    constexpr size_t npos = size_t(-1);
+    auto last_writer = [&](uint32_t r, uint32_t c, size_t before) -> size_t {
+        for (size_t i = before; i-- > temps + 1;) {
+            Operand dst;
+            if (!single_destination(code_[i].op) || !code_[i].operands(&dst, 1))
+                return npos;
+            if (dst.type == kTemp && dst.mode == 0 && dst.index[0] == r && (dst.bits & (1u << c)))
+                return i;
+        }
+        return npos;
+    };
+    // The coordinate: mad D, A, M.mmmm, uv.
+    const size_t w = last_writer(coord.index[0], cy, s);
+    if (w == npos || last_writer(coord.index[0], cx, s) != w)
+        return false;
+    Operand wo[4];
+    if (code_[w].op != 50 || (read(code_[w].p) & 0x80002000u) || !code_[w].operands(wo, 4))
+        return false;
+    const Operand &d = wo[0], &a = wo[1], &m = wo[2];
+    if (d.mode != 0 || a.type != kTemp || a.mode != 1 || a.neg || m.type != kTemp || m.mode != 1 || m.neg ||
+        wo[3].type != kTemp || wo[3].neg)
+        return false;
+    const uint32_t mc = m.bits & 3, ay = (a.bits >> (2 * cy)) & 3;
+    if (m.bits != mc * 0x55u)
+        return false;
+    // A.ay = 1 - B * PS_HPosScale.y: the shift is inside the masked term.
+    const size_t shift = last_writer(a.index[0], ay, w);
+    Operand ho[4];
+    if (shift == npos || code_[shift].op != 50 || (read(code_[shift].p) & 0x80002000u) ||
+        !code_[shift].operands(ho, 4) || ho[0].bits != (1u << ay) || ho[1].type != kTemp || !ho[1].neg ||
+        ho[2].type != kConstantBuffer || ho[2].mode != 2 || ho[2].bits != 1 || ho[2].neg ||
+        ho[2].index[0] != hpos_cb || ho[2].index[1] != hpos_vec || ho[3].type != kImmediate ||
+        ho[3].imm != 0x3f800000u)
+        return false;
+    // M.mc = (...) & 1.0: 0 or 1.
+    const size_t mask = last_writer(m.index[0], mc, w);
+    Operand mo[3];
+    if (mask == npos || code_[mask].op != 1 || (read(code_[mask].p) & 0x80002000u) ||
+        !code_[mask].operands(mo, 3) || mo[0].bits != (1u << mc) || mo[2].type != kImmediate ||
+        mo[2].imm != 0x3f800000u)
+        return false;
+
+    const uint32_t D = coord.index[0], M = m.index[0];
+    // Before the mad (it may overwrite the mask):
+    //   add rN.x, -M.mc, l(1.0)          1 - mask
+    const uint32_t before_mad[] = {0x08000000, 0x00100012, reg, 0x8010000au | (mc << 4), 0x41, M, 0x00004001,
+                                   0x3f800000};
+    // Before the sample:
+    //   add rN.y, -cb[hpos].y, l(1.0)    1 - PS_HPosScale.y
+    //   mad rN.y, rN.x, rN.y, D.cy       coordinate.y + (1 - mask) * (1 - PS_HPosScale.y)
+    //   mov rN.x, D.cx
+    const uint32_t before_sample[] = {
+        0x09000000, 0x00100022, reg, 0x8020801au, 0x41, hpos_cb, hpos_vec, 0x00004001, 0x3f800000,
+        0x09000032, 0x00100022, reg, 0x0010000a, reg, 0x0010001a, reg, 0x0010000au | (cy << 4), D,
+        0x05000036, 0x00100012, reg, 0x0010000au | (cx << 4), D};
+    const size_t coord_at = so[0].words + code_[s].first_operand();
+    size_t index = 0;
+    auto edit = [&](const uint8_t* instr, uint32_t, uint32_t n, std::vector<uint8_t>& words) {
+        const size_t i = index++;
+        if (i == w)
+            for (auto v : before_mad)
+                append(words, v);
+        if (i == s)
+            for (auto v : before_sample)
+                append(words, v);
+        const size_t at = words.size();
+        words.insert(words.end(), instr, instr + n * 4);
+        if (i == temps)
+            store(words, at + 4, reg + 1);
+        if (i == s) {
+            // The coordinate operand: rN.xyxx.
+            store(words, at + coord_at * 4, (read(instr + coord_at * 4) & ~0xff0u) | (0x04u << 4));
+            store(words, at + (coord_at + 1) * 4, reg);
+        }
+        return true;
+    };
+    std::vector<uint8_t> out;
+    if (!rewrite_program(b, size, edit, out, false) || index != code_.size())
         return false;
     patched = std::move(out);
     return true;

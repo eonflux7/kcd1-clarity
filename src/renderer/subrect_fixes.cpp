@@ -59,6 +59,48 @@ bool water_reflection(const void* code, SIZE_T size) {
     }
     return false;
 }
+// The water surface (WaterPS, any permutation): the ReflSampler texture register and where
+// PS_HPosScale lives (constant buffer register, float4 index). False if it is not one.
+bool water_surface(const void* code, SIZE_T size, unsigned& refl, unsigned& cb, unsigned& vec) {
+    const auto* bytes = static_cast<const char*>(code);
+    constexpr char name[] = "ReflSampler";
+    bool candidate = false;
+    for (SIZE_T i = 0; i + sizeof(name) <= size && !candidate; ++i)
+        candidate = !std::memcmp(bytes + i, name, sizeof(name));
+    if (!candidate)
+        return false;
+    ComPtr<ID3D11ShaderReflection> r;
+    if (FAILED(D3DReflect(code, size, __uuidof(ID3D11ShaderReflection), reinterpret_cast<void**>(r.GetAddressOf()))))
+        return false;
+    D3D11_SHADER_DESC desc{};
+    r->GetDesc(&desc);
+    bool found = false;
+    for (UINT i = 0; i < desc.BoundResources && !found; ++i) {
+        D3D11_SHADER_INPUT_BIND_DESC d{};
+        // CryEngine retains identical names for the sampler and texture entries.
+        if (SUCCEEDED(r->GetResourceBindingDesc(i, &d)) && d.Type == D3D_SIT_TEXTURE &&
+            d.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && !std::strcmp(d.Name, name)) {
+            refl = d.BindPoint;
+            found = true;
+        }
+    }
+    if (!found)
+        return false;
+    for (UINT i = 0; i < desc.ConstantBuffers; ++i) {
+        auto* buffer = r->GetConstantBufferByIndex(i);
+        D3D11_SHADER_VARIABLE_DESC v{};
+        D3D11_SHADER_BUFFER_DESC b{};
+        D3D11_SHADER_INPUT_BIND_DESC d{};
+        if (SUCCEEDED(buffer->GetVariableByName("PS_HPosScale")->GetDesc(&v)) && SUCCEEDED(buffer->GetDesc(&b)) &&
+            SUCCEEDED(r->GetResourceBindingDescByName(b.Name, &d)) && d.Type == D3D_SIT_CBUFFER &&
+            v.StartOffset % 16 == 0) {
+            cb = d.BindPoint;
+            vec = v.StartOffset / 16;
+            return true;
+        }
+    }
+    return false;
+}
 constexpr char kStencil[] = R"(
 Texture2D<uint2> StencilTex : register(t4);
 float4 main(float4 p : SV_Position) : SV_Target {
@@ -85,6 +127,9 @@ Shader classify_ps(ID3D11Device* device, const void* code, SIZE_T size) {
         kind = Kind::HairContact;
     if (kind == Kind::None && water_reflection(code, size))
         kind = Kind::WaterReflection;
+    unsigned refl = 0, hpos_cb = 0, hpos_vec = 0;
+    if (kind == Kind::None && water_surface(code, size, refl, hpos_cb, hpos_vec))
+        kind = Kind::WaterSurface;
     if (kind == Kind::None)
         return {};
     ComPtr<ID3D11PixelShader> replacement;
@@ -100,6 +145,18 @@ Shader classify_ps(ID3D11Device* device, const void* code, SIZE_T size) {
         const bool ok = kind == Kind::Contact ? dxbc::patch_contact_depth_uv(code, size, patched)
                                               : dxbc::patch_forward_depth_origins(code, size, patched);
         hr = ok ? device->CreatePixelShader(patched.data(), patched.size(), nullptr, &replacement) : E_FAIL;
+    } else if (kind == Kind::WaterSurface) {
+        std::vector<uint8_t> patched;
+        if (!dxbc::patch_water_refl_fallback(code, size, refl, hpos_cb, hpos_vec, patched)) {
+            static int logged;
+            if (logged++ < 4)
+                logf("subrect: water surface shader (ReflSampler t%u) not recognised, left as is", refl);
+            return {};
+        }
+        hr = device->CreatePixelShader(patched.data(), patched.size(), nullptr, &replacement);
+        static int logged;
+        if (SUCCEEDED(hr) && logged++ < 4)
+            logf("subrect: water surface shader #%d: masked reflection reads shifted into the sub-rect", logged);
     }
     if (FAILED(hr)) {
         logf("subrect: shader correction setup failed 0x%08lx", hr);
