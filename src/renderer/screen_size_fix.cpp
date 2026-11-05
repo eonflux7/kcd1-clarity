@@ -93,6 +93,8 @@ bool reflect_ps(const void* code, SIZE_T size, Shader* out) {
         if (!ssdo && !find_var(r, "SSSBlurDir", &radius_slot, &out->radius_offset))
             radius_slot = ~0u;
         bool ok = find_var(r, "ViewSpaceParams", &out->cb_slot, &out->offset) && out->offset % 16 == 0;
+        if (ssdo && !(find_var(r, "PS_ScreenSize", &out->size_slot, &out->size_offset) && out->size_offset % 16 == 0))
+            out->size_slot = out->size_offset = ~0u;
         r->Release();
         if (ok) {  // else only declared: try the other kinds
             if (radius_slot != out->cb_slot || out->radius_offset % 16 != 0) {
@@ -102,11 +104,13 @@ bool reflect_ps(const void* code, SIZE_T size, Shader* out) {
             out->radius_xy_only = !ssdo;
             out->kind = Shader::ViewSpacePS;
             ++g_status.ps_seen;
-            logf("screen_size_fix: view-space PS (%s): ViewSpaceParams cb%u +%u, radius +%d", ssdo ? "SSDO" : "SSS",
-                 out->cb_slot, out->offset, out->radius_offset == ~0u ? -1 : int(out->radius_offset));
+            logf("screen_size_fix: view-space PS (%s): ViewSpaceParams cb%u +%u, radius +%d, PS_ScreenSize cb%d +%d",
+                 ssdo ? "SSDO" : "SSS", out->cb_slot, out->offset,
+                 out->radius_offset == ~0u ? -1 : int(out->radius_offset), int(out->size_slot), int(out->size_offset));
             return true;
         }
         out->radius_offset = ~0u;
+        out->size_slot = out->size_offset = ~0u;
     }
     if (contains(code, size, "vDofParamsFocus") && !contains(code, size, "PS_NearFarClipDist")) {
         // Gather DOF passes other than the prep and the composite (those read PS_NearFarClipDist).
@@ -189,7 +193,8 @@ bool reflect_vs(const void* code, SIZE_T size, Shader* out) {
         logf("screen_size_fix: DOF VS");
         return true;
     }
-    if (!contains(code, size, "g_VS_HPosScale"))
+    const bool hpos = contains(code, size, "g_VS_HPosScale"), screen = contains(code, size, "g_ScreenSize");
+    if (!hpos && !screen)
         return false;
     ID3D11ShaderReflection* r = nullptr;
     if (FAILED(D3DReflect(code, size, __uuidof(ID3D11ShaderReflection), reinterpret_cast<void**>(&r))))
@@ -204,38 +209,56 @@ bool reflect_vs(const void* code, SIZE_T size, Shader* out) {
         if (!_stricmp(p.SemanticName, "TEXCOORD") && p.SemanticIndex == 0)
             tc_reg = static_cast<int>(p.Register);
     }
-    bool found = tc_reg >= 0 && find_var(r, "g_VS_HPosScale", &out->cb_slot, &out->offset);
+    UINT hpos_slot = ~0u, hpos_offset = ~0u, size_slot = ~0u, size_offset = ~0u;
+    bool found_hpos = tc_reg >= 0 && hpos && find_var(r, "g_VS_HPosScale", &hpos_slot, &hpos_offset);
+    bool found_size = tc_reg >= 0 && screen && find_var(r, "g_ScreenSize", &size_slot, &size_offset);
     r->Release();
-    if (!found)
+    if (!found_hpos && !found_size)
         return false;
-    // Self-scaling = some instruction multiplies the input UV by g_VS_HPosScale.xy.
     ID3DBlob* dis = nullptr;
     if (FAILED(D3DDisassemble(code, size, 0, nullptr, &dis)))
         return false;
     std::string text(static_cast<const char*>(dis->GetBufferPointer()), dis->GetBufferSize());
     dis->Release();
-    char v[16], c[24];
-    snprintf(v, sizeof(v), "v%d.xy", tc_reg);
-    snprintf(c, sizeof(c), "cb%u[%u].xy", out->cb_slot, out->offset / 16);
-    bool self_scaling = false;
-    for (size_t pos = 0; pos < text.size();) {
-        size_t end = text.find('\n', pos);
-        if (end == std::string::npos)
-            end = text.size();
-        std::string line = text.substr(pos, end - pos);
-        size_t first = line.find_first_not_of(' ');
-        if (first != std::string::npos && (line.compare(first, 4, "mul ") == 0 || line.compare(first, 4, "mad ") == 0) && line.find(v) != std::string::npos &&
-            line.find(c) != std::string::npos)
-            self_scaling = true;
-        pos = end + 1;
-    }
-    if (!self_scaling || out->offset % 16 != 0)  // .xy of a float4 register
+    // Some mul/mad multiplies the input UV (v<tc>.<v_swz>) by the constant (cb<slot>[<reg>].<c_swz>).
+    auto multiplies_uv = [&](UINT slot, UINT offset, const char* v_swz, const char* c_swz) {
+        char v[16], c[24];
+        snprintf(v, sizeof(v), "v%d.%s", tc_reg, v_swz);
+        snprintf(c, sizeof(c), "cb%u[%u].%s", slot, offset / 16, c_swz);
+        for (size_t pos = 0; pos < text.size();) {
+            size_t end = text.find('\n', pos);
+            if (end == std::string::npos)
+                end = text.size();
+            std::string line = text.substr(pos, end - pos);
+            size_t first = line.find_first_not_of(' ');
+            if (first != std::string::npos && (line.compare(first, 4, "mul ") == 0 || line.compare(first, 4, "mad ") == 0) && line.find(v) != std::string::npos &&
+                line.find(c) != std::string::npos)
+                return true;
+            pos = end + 1;
+        }
         return false;
-    out->kind = Shader::SelfScalingVS;
-    ++g_status.vs_seen;
-    logf("screen_size_fix: self-scaling VS: TEXCOORD0 v%d * g_VS_HPosScale cb%u +%u", tc_reg, out->cb_slot,
-         out->offset);
-    return true;
+    };
+    // Self-scaling = the input UV times g_VS_HPosScale.xy (.xy of a float4 register).
+    if (found_hpos && hpos_offset % 16 == 0 && multiplies_uv(hpos_slot, hpos_offset, "xy", "xy")) {
+        out->kind = Shader::SelfScalingVS;
+        out->cb_slot = hpos_slot;
+        out->offset = hpos_offset;
+        ++g_status.vs_seen;
+        logf("screen_size_fix: self-scaling VS: TEXCOORD0 v%d * g_VS_HPosScale cb%u +%u", tc_reg, out->cb_slot,
+             out->offset);
+        return true;
+    }
+    // Pixel-grid VS (DirOccPassVS): the input UV times g_ScreenSize.xy, any swizzle.
+    if (found_size && size_offset % 16 == 0 && multiplies_uv(size_slot, size_offset, "", "")) {
+        out->kind = Shader::ScreenSizeVS;
+        out->cb_slot = size_slot;
+        out->offset = size_offset;
+        ++g_status.vs_seen;
+        logf("screen_size_fix: pixel-grid VS: TEXCOORD0 v%d * g_ScreenSize cb%u +%u", tc_reg, out->cb_slot,
+             out->offset);
+        return true;
+    }
+    return false;
 }
 
 // One patched constant buffer: a copy of the engine's with 8 bytes replaced.
@@ -566,6 +589,7 @@ struct ViewProjPatch {
 };
 
 static ViewProjPatch g_viewproj_patch, g_viewspace_patch, g_reproj_patch;  // separate: buffer sizes differ
+static ViewProjPatch g_ssdo_size_patch, g_ssdo_vs_patch;  // bound at the same time as g_viewspace_patch's
 
 // Edge padding: outside the sub-rect the linear depth targets hold 1.0 (far plane), and the sampler only clamps at
 // the texture border. Taps past the sub-rect's right/bottom edge (SSDO's offsets, the SVO trace's screen march) then
@@ -769,7 +793,57 @@ static void pad_depth_inputs(ID3D11DeviceContext* ctx, DrawFn original) {
     g_status.edge_padded = g_edge_pad.padded;
 }
 
-void draw(ID3D11DeviceContext* ctx, const Shader& ps, const Shader* /*vs*/, UINT count, UINT start, DrawFn original) {
+// SSDO noise tiling: binds copies of the VS's g_ScreenSize buffer and, when it is not the ViewSpaceParams one, the
+// PS's PS_ScreenSize buffer with .xy / s and .zw * s. Undone by ssdo_noise_end.
+struct SsdoNoise {
+    ID3D11Buffer* vs_cb = nullptr;
+    ID3D11Buffer* ps_cb = nullptr;
+    UINT vs_slot = ~0u, ps_slot = ~0u;
+};
+
+static void size_op(RegOp& op, UINT offset, game::Vec2 d) {
+    op.off = offset;
+    const float m[4] = {1.0f / d.x, 1.0f / d.y, d.x, d.y};
+    memcpy(op.mul, m, sizeof(m));
+}
+
+static SsdoNoise ssdo_noise_begin(ID3D11DeviceContext* ctx, const Shader& ps, const Shader* vs, game::Vec2 d) {
+    SsdoNoise n;
+    if (vs && vs->kind == Shader::ScreenSizeVS) {
+        ctx->VSGetConstantBuffers(vs->cb_slot, 1, &n.vs_cb);
+        RegOp ops[3];
+        size_op(ops[0], vs->offset, d);
+        if (ID3D11Buffer* b = n.vs_cb ? g_ssdo_vs_patch.rewrite(ctx, n.vs_cb, ops) : nullptr) {
+            ctx->VSSetConstantBuffers(vs->cb_slot, 1, &b);
+            n.vs_slot = vs->cb_slot;
+        }
+    }
+    if (ps.size_slot != ~0u && ps.size_slot != ps.cb_slot) {
+        ctx->PSGetConstantBuffers(ps.size_slot, 1, &n.ps_cb);
+        RegOp ops[3];
+        size_op(ops[0], ps.size_offset, d);
+        if (ID3D11Buffer* b = n.ps_cb ? g_ssdo_size_patch.rewrite(ctx, n.ps_cb, ops) : nullptr) {
+            ctx->PSSetConstantBuffers(ps.size_slot, 1, &b);
+            n.ps_slot = ps.size_slot;
+        }
+    }
+    if (n.vs_slot != ~0u)
+        ++g_status.ssdo_noise_fixed;
+    return n;
+}
+
+static void ssdo_noise_end(ID3D11DeviceContext* ctx, SsdoNoise& n) {
+    if (n.vs_slot != ~0u)
+        ctx->VSSetConstantBuffers(n.vs_slot, 1, &n.vs_cb);
+    if (n.ps_slot != ~0u)
+        ctx->PSSetConstantBuffers(n.ps_slot, 1, &n.ps_cb);
+    if (n.vs_cb)
+        n.vs_cb->Release();
+    if (n.ps_cb)
+        n.ps_cb->Release();
+}
+
+void draw(ID3D11DeviceContext* ctx, const Shader& ps, const Shader* vs, UINT count, UINT start, DrawFn original) {
     if (!g_status.enabled || ps.kind == Shader::DofPS || ps.kind == Shader::DofGatherPS) {
         original(ctx, count, start);
         return;
@@ -799,6 +873,7 @@ void draw(ID3D11DeviceContext* ctx, const Shader& ps, const Shader* /*vs*/, UINT
         if (d.x < 0.999f || d.y < 0.999f)
             ctx->PSGetConstantBuffers(ps.cb_slot, 1, &cb);
         RegOp ops[3];
+        const bool ssdo_noise = cb && ps.kind == Shader::ViewSpacePS && !ps.radius_xy_only && g_status.ssdo_noise;
         if (ps.kind == Shader::ViewSpacePS) {
             ops[0].off = ps.offset;
             const float view[4] = {1.0f / d.x, 1.0f / d.y, 1, 1};
@@ -806,6 +881,8 @@ void draw(ID3D11DeviceContext* ctx, const Shader& ps, const Shader* /*vs*/, UINT
             ops[1].off = ps.radius_offset;
             const float radius[4] = {d.x, d.y, ps.radius_xy_only ? 1.0f : d.x, ps.radius_xy_only ? 1.0f : d.x};
             memcpy(ops[1].mul, radius, sizeof(radius));
+            if (ssdo_noise && ps.size_slot == ps.cb_slot)
+                size_op(ops[2], ps.size_offset, d);
         } else {
             // prev = (M * (uv, 1, w)).xy / row2: input uv = uv'/s (columns x, y * 1/s), output * s (rows 0, 1).
             const float m[3][4] = {{1, d.x / d.y, d.x, d.x}, {d.y / d.x, 1, d.y, d.y}, {1 / d.x, 1 / d.y, 1, 1}};
@@ -820,7 +897,11 @@ void draw(ID3D11DeviceContext* ctx, const Shader& ps, const Shader* /*vs*/, UINT
             ctx->PSSetConstantBuffers(ps.cb_slot, 1, &b);
             ++g_status.ps_fixed;
         }
+        SsdoNoise noise;
+        if (ssdo_noise)
+            noise = ssdo_noise_begin(ctx, ps, vs, d);
         original(ctx, count, start);
+        ssdo_noise_end(ctx, noise);
         if (b)
             ctx->PSSetConstantBuffers(ps.cb_slot, 1, &cb);
         if (cb)

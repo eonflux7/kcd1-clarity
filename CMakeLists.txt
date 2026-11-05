@@ -74,6 +74,8 @@ add_library(kcd_clarity SHARED
     src/game/symbols.cpp
     src/hooks/d3d11_hooks.cpp
     src/hooks/present.cpp
+    src/renderer/dxbc_patch.cpp
+    src/renderer/subrect_fixes.cpp
     src/renderer/canary.cpp
     src/renderer/frame_dump.cpp
     src/renderer/mip_bias.cpp
