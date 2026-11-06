@@ -372,15 +372,26 @@ static void canary_before_draw(ID3D11DeviceContext* ctx) {
     t_inside = false;
 }
 
-static void ui_depth_before_draw(ID3D11DeviceContext* ctx) {
-    if (t_inside)
-        return;
-    ScopedInside inside;
-    ui_depth::before_draw(ctx, g_bound_ps);
-}
+// Keep the private menu DSV only for the current draw, including early returns.
+struct UiDepthDraw {
+    ID3D11DeviceContext* ctx;
+    ui_depth::DrawState state;
+    explicit UiDepthDraw(ID3D11DeviceContext* context) : ctx(context) {
+        if (t_inside)
+            return;
+        ScopedInside inside;
+        ui_depth::before_draw(ctx, g_bound_ps, state);
+    }
+    ~UiDepthDraw() {
+        if (!state.depth)
+            return;
+        ScopedInside inside;
+        ui_depth::after_draw(ctx, state);
+    }
+};
 
 static void STDMETHODCALLTYPE hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base) {
-    ui_depth_before_draw(ctx);
+    UiDepthDraw ui_depth(ctx);
     canary_before_draw(ctx);
     SubrectDraw subrect(ctx);
     o_draw_indexed(ctx, count, start, base);
@@ -388,7 +399,7 @@ static void STDMETHODCALLTYPE hk_draw_indexed(ID3D11DeviceContext* ctx, UINT cou
 
 static void STDMETHODCALLTYPE hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, UINT count, UINT instances,
                                                         UINT start, INT base, UINT start_instance) {
-    ui_depth_before_draw(ctx);
+    UiDepthDraw ui_depth(ctx);
     canary_before_draw(ctx);
     SubrectDraw subrect(ctx);
     o_draw_indexed_instanced(ctx, count, instances, start, base, start_instance);
@@ -396,7 +407,7 @@ static void STDMETHODCALLTYPE hk_draw_indexed_instanced(ID3D11DeviceContext* ctx
 
 static void STDMETHODCALLTYPE hk_draw_instanced(ID3D11DeviceContext* ctx, UINT count, UINT instances, UINT start,
                                                 UINT start_instance) {
-    ui_depth_before_draw(ctx);
+    UiDepthDraw ui_depth(ctx);
     canary_before_draw(ctx);
     SubrectDraw subrect(ctx);
     o_draw_instanced(ctx, count, instances, start, start_instance);
@@ -474,7 +485,7 @@ static void STDMETHODCALLTYPE hk_ps_set_samplers(ID3D11DeviceContext* ctx, UINT 
 }
 
 static void STDMETHODCALLTYPE hk_draw(ID3D11DeviceContext* ctx, UINT count, UINT start) {
-    ui_depth_before_draw(ctx);
+    UiDepthDraw ui_depth(ctx);
     canary_before_draw(ctx);  // also the TAA draw's inputs (our DLSS path reads them too)
     SubrectDraw subrect(ctx);
     if (g_bound_taa && !t_inside)
