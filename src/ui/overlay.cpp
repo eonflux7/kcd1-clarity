@@ -1,7 +1,7 @@
 // ImGui overlay drawn into the game's back buffer just before Present: the settings menu (F8) for players
 // and the debug window (F3).
 //
-// Threads: only on_present (render thread) calls ImGui. wndproc just queues the messages ImGui
+// Threads: Present and the matched shared-copy hook call ImGui on the render thread. wndproc queues the messages ImGui
 // needs; on_present replays them before NewFrame with no lock held. Calling ImGui from wndproc
 // under a lock deadlocked: ImGui's SetCapture re-enters wndproc synchronously (WM_CAPTURECHANGED).
 //
@@ -51,8 +51,12 @@ namespace kc::overlay {
 static std::recursive_mutex g_render_mutex;
 static bool g_initialized;
 static bool g_failed;
-static IDXGISwapChain* g_swapchain;  // identity only, no reference held
+static IDXGISwapChain* g_swapchain;  // owned only for the hidden shared-copy presenter
 static HWND g_window;
+static HWND g_render_window;
+static bool g_bridge;
+static bool g_bridge_drawn;
+static ID3D11Texture2D* g_rtv_source;  // identity only; g_rtv owns the resource reference
 static WNDPROC g_game_wndproc;
 static ID3D11Device* g_device;
 static ID3D11DeviceContext* g_context;
@@ -238,6 +242,25 @@ static void read_gpu(ID3D11Device* device) {
     logf("overlay: GPU %s, vendor 0x%04x", g_gpu_name, g_gpu_vendor);
 }
 
+static HWND visible_game_window() {
+    struct Search { HWND result = nullptr; unsigned count = 0; } search;
+    EnumWindows([](HWND hwnd, LPARAM param) -> BOOL {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER))
+            return TRUE;
+        wchar_t title[128] = {};
+        GetWindowTextW(hwnd, title, 128);
+        if (lstrcmpiW(title, L"Kingdom Come: Deliverance") != 0)
+            return TRUE;
+        auto& found = *reinterpret_cast<Search*>(param);
+        found.result = hwnd;
+        ++found.count;
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.count == 1 ? search.result : nullptr;
+}
+
 static bool init(IDXGISwapChain* swapchain) {
     if (FAILED(swapchain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&g_device)))) {
         logf("overlay: swapchain has no D3D11 device, overlay disabled");
@@ -248,6 +271,15 @@ static bool init(IDXGISwapChain* swapchain) {
     DXGI_SWAP_CHAIN_DESC desc;
     swapchain->GetDesc(&desc);
     g_window = desc.OutputWindow;
+    g_render_window = desc.OutputWindow;
+    if (!IsWindowVisible(g_render_window)) {
+        if (HWND real_window = visible_game_window()) {
+            g_window = real_window;
+            g_bridge = true;
+            logf("overlay: bridge1 input window %p, hidden render window %p; draw before shared copy",
+                 g_window, g_render_window);
+        }
+    }
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -262,6 +294,8 @@ static bool init(IDXGISwapChain* swapchain) {
     g_game_wndproc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndproc)));
     g_swapchain = swapchain;
+    if (g_bridge)
+        g_swapchain->AddRef();  // the copy hook may run before a replacement swapchain's first Present
     g_menu_visible = config().show_on_start;
     QueryPerformanceFrequency(&g_qpc_freq);
     QueryPerformanceCounter(&g_qpc_last);
@@ -621,7 +655,7 @@ static void draw_debug_window(IDXGISwapChain* swapchain) {
 
 // ---------------------------------------------------------------------------------------------------------
 
-void on_present(IDXGISwapChain* swapchain) {
+static void render_frame(IDXGISwapChain* swapchain, ID3D11Texture2D* source) {
     if (g_failed)
         return;
     if (!g_initialized) {
@@ -630,12 +664,20 @@ void on_present(IDXGISwapChain* swapchain) {
         if (g_failed)
             return;
     }
+    // A hidden DX11 Present happens after OptiScaler has already copied the frame to DX12.
+    // The copy hook calls this function with the actual source buffer instead.
+    if (g_bridge && !source)
+        return;
     if (swapchain != g_swapchain) {
         DXGI_SWAP_CHAIN_DESC desc;
-        if (FAILED(swapchain->GetDesc(&desc)) || desc.OutputWindow != g_window)
+        if (FAILED(swapchain->GetDesc(&desc)) || desc.OutputWindow != g_render_window)
             return;  // some other swapchain (not the game window)
         logf("overlay: game window has a new swapchain %p", swapchain);
         on_resize_begin();
+        if (g_bridge) {
+            swapchain->AddRef();
+            g_swapchain->Release();
+        }
         g_swapchain = swapchain;
     }
 
@@ -659,9 +701,18 @@ void on_present(IDXGISwapChain* swapchain) {
 
     POINT motion = drain_messages();
     std::lock_guard lock(g_render_mutex);
+    if (source && g_rtv_source != source) {
+        if (g_rtv)
+            g_rtv->Release();
+        g_rtv = nullptr;
+        g_rtv_source = nullptr;
+    }
     if (!g_rtv) {
         ID3D11Texture2D* back_buffer = nullptr;
-        if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back_buffer))))
+        if (source) {
+            back_buffer = source;
+            back_buffer->AddRef();
+        } else if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back_buffer))))
             return;
         HRESULT hr = g_device->CreateRenderTargetView(back_buffer, nullptr, &g_rtv);
         back_buffer->Release();
@@ -669,6 +720,7 @@ void on_present(IDXGISwapChain* swapchain) {
             logf("overlay: CreateRenderTargetView failed 0x%08lx", hr);
             return;
         }
+        g_rtv_source = source;
     }
 
     ImGui::GetIO().MouseDrawCursor = visible;
@@ -702,12 +754,62 @@ void on_present(IDXGISwapChain* swapchain) {
         saved_dsv->Release();
 }
 
+void on_present(IDXGISwapChain* swapchain) {
+    render_frame(swapchain, nullptr);
+    g_bridge_drawn = false;
+}
+
+void before_copy(ID3D11DeviceContext* ctx, ID3D11Resource* destination, ID3D11Resource* source) {
+    if (!g_initialized || !g_bridge || g_failed || g_bridge_drawn || ctx != g_context || !destination || !source)
+        return;
+    ID3D11Texture2D* target = nullptr;
+    if (FAILED(destination->QueryInterface(IID_PPV_ARGS(&target))))
+        return;
+    D3D11_TEXTURE2D_DESC target_desc{};
+    target->GetDesc(&target_desc);
+    target->Release();
+    if (!(target_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE)))
+        return;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(g_swapchain->GetDesc(&desc)))
+        return;
+    // Match the source against the presenter's own buffers, never arbitrary game/NR textures.
+    // Do not retain buffer references across ResizeBuffers.
+    ID3D11Texture2D* matched = nullptr;
+    for (UINT i = 0; i < desc.BufferCount && i < 8; ++i) {
+        ID3D11Texture2D* buffer = nullptr;
+        if (SUCCEEDED(g_swapchain->GetBuffer(i, IID_PPV_ARGS(&buffer)))) {
+            IUnknown* buffer_identity = nullptr;
+            IUnknown* source_identity = nullptr;
+            buffer->QueryInterface(IID_PPV_ARGS(&buffer_identity));
+            source->QueryInterface(IID_PPV_ARGS(&source_identity));
+            bool same = buffer_identity && buffer_identity == source_identity;
+            if (buffer_identity) buffer_identity->Release();
+            if (source_identity) source_identity->Release();
+            if (same) { matched = buffer; break; }
+            buffer->Release();
+        }
+    }
+    if (!matched)
+        return;
+    g_bridge_drawn = true;  // also prevents recursion from the overlay backend's own copy calls
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        logf("overlay: bridge1 matched shared back-buffer copy; drawing F8/F3 on the visible frame");
+    }
+    render_frame(g_swapchain, matched);
+    matched->Release();
+}
+
 void on_resize_begin() {
     std::lock_guard lock(g_render_mutex);
     if (g_rtv) {
         g_rtv->Release();
         g_rtv = nullptr;
     }
+    g_rtv_source = nullptr;
+    g_bridge_drawn = false;
 }
 
 }  // namespace kc::overlay
