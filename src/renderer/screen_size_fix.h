@@ -40,14 +40,21 @@ namespace kc::screen_size_fix {
 // Both SSDO and that trace also read depth past the sub-rect's right/bottom edge (SSDO's minimum tap radius is 0.1
 // of the screen), where the linear depth targets hold 1.0 = sky: unoccluded sky ambient, a blue glow along the right
 // edge under the canopy. Before those draws the outside region of their depth inputs gets the last valid column/row.
+// SSDO noise tiling (DirOccPassVS/PS): the sample-rotation index is frac(uv * g_ScreenSize.xy * 0.25), a 4x4 pixel
+// tile that the SSDO blur (2-texel steps) averages out, and the max radius alternates with int(uv * PS_ScreenSize.xy)
+// & 1. Both sizes are the scaled viewport while the UVs span 0..s, so the tile grew to 4/s pixels (8 at
+// Performance): the blur no longer cancelled it and vertical stripes (the index mostly varies along x) showed on
+// occluded walls, sharpened further by DLSS. Fix: during the SSDO draw the VS's g_ScreenSize.xy and the PS's
+// PS_ScreenSize.xy are divided by s (zw, the half-texel sizes, multiplied).
 struct Shader {
-    enum Kind { FogPS, LumInitialPS, ViewProjPS, SelfScalingVS, DofPS, DofGatherPS, DofVS, ViewSpacePS, ReprojPS, TiledShadingCS } kind = FogPS;
+    enum Kind { FogPS, LumInitialPS, ViewProjPS, SelfScalingVS, DofPS, DofGatherPS, DofVS, ViewSpacePS, ReprojPS, TiledShadingCS, ScreenSizeVS } kind = FogPS;
     void* shader = nullptr;  // ID3D11PixelShader* / ID3D11VertexShader*, identity only
     UINT cb_slot = ~0u;      // constant buffer holding the value to replace
     UINT offset = 0;         // byte offset of it
     UINT zmap_slot = ~0u;    // pixel shaders: zMap texture (its size is the full size)
     UINT radius_offset = ~0u;  // ViewSpacePS: SSDOParams / SSSBlurDir (UV-unit radii), same buffer as ViewSpaceParams
     bool radius_xy_only = false;  // SSSBlurDir: only .xy are radii
+    UINT size_slot = ~0u, size_offset = ~0u;  // SSDO PS: PS_ScreenSize (ScreenSizeVS: g_ScreenSize is cb_slot/offset)
     UINT tiled[3] = {~0u, ~0u, ~0u};  // TiledShadingCS: FrustumTR, FrustumBL, ProjParams (offset: FrustumTL)
 };
 
@@ -58,9 +65,10 @@ bool reflect_cs(const void* code, SIZE_T size, Shader* out);
 
 struct Status {
     bool enabled = true;
+    bool ssdo_noise = true;  // SSDO noise tiling fix (needs enabled too)
     uint32_t ps_seen = 0, vs_seen = 0;
     uint64_t ps_fixed = 0, vs_fixed = 0, shrunk = 0, non_screen = 0, bloom_fixed = 0,
-             dof_shrunk = 0, edge_padded = 0;
+             dof_shrunk = 0, edge_padded = 0, ssdo_noise_fixed = 0;
 };
 Status& status();
 

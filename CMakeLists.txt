@@ -1,7 +1,7 @@
 # KCD1 Clarity: DLSS for Kingdom Come: Deliverance. Built on Windows with MSVC (build.cmd).
 # Output is dinput8.dll: a proxy for System32\dinput8.dll that WHGame.dll loads from Bin\Win64.
 cmake_minimum_required(VERSION 3.24)
-project(kcd_clarity VERSION 0.2.0 LANGUAGES C CXX ASM_MASM)
+project(kcd_clarity VERSION 0.3.0 LANGUAGES C CXX ASM_MASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,6 +74,8 @@ add_library(kcd_clarity SHARED
     src/game/symbols.cpp
     src/hooks/d3d11_hooks.cpp
     src/hooks/present.cpp
+    src/renderer/dxbc_patch.cpp
+    src/renderer/subrect_fixes.cpp
     src/renderer/canary.cpp
     src/renderer/frame_dump.cpp
     src/renderer/mip_bias.cpp
