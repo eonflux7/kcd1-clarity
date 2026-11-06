@@ -18,8 +18,10 @@ void logf(const char *fmt, ...) {
     va_end(a);
 }
 namespace frame_dump {
-bool armed() { return false; }
-void save(ID3D11DeviceContext *, ID3D11Resource *, const char *) {}
+bool capture = false;
+unsigned saved = 0;
+bool armed() { return capture; }
+void save(ID3D11DeviceContext *, ID3D11Resource *, const char *) { ++saved; }
 } // namespace frame_dump
 } // namespace kc
 static void check(bool ok, const char *msg) {
@@ -46,6 +48,26 @@ static std::vector<unsigned> read(ID3D11Device *dev, ID3D11DeviceContext *ctx, I
         memcpy(result.data() + y * d.Width, static_cast<char *>(m.pData) + y * m.RowPitch, d.Width * 4);
     ctx->Unmap(staging.Get(), 0);
     return result;
+}
+// Run the same before/after pairing as the draw hook, retaining the texture
+// actually bound during that draw for offscreen validation afterwards.
+static ComPtr<ID3D11Texture2D> correct(ID3D11DeviceContext *ctx, ID3D11PixelShader *shader,
+                                     UINT *flags = nullptr) {
+    kc::ui_depth::DrawState scope;
+    kc::ui_depth::before_draw(ctx, shader, scope);
+    ComPtr<ID3D11DepthStencilView> dsv;
+    ctx->OMGetRenderTargets(0, nullptr, &dsv);
+    ComPtr<ID3D11Resource> resource;
+    dsv->GetResource(&resource);
+    ComPtr<ID3D11Texture2D> texture;
+    check(SUCCEEDED(resource.As(&texture)), "draw depth texture");
+    if (flags) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC desc{};
+        dsv->GetDesc(&desc);
+        *flags = desc.Flags;
+    }
+    kc::ui_depth::after_draw(ctx, scope);
+    return texture;
 }
 int wmain(int argc, wchar_t **argv) {
     check(argc == 2, "test INI path supplied");
@@ -120,14 +142,20 @@ int wmain(int argc, wchar_t **argv) {
     ctx->OMSetDepthStencilState(state.Get(), 9);
     kc::ui_depth::set_enabled(false);
     kc::ui_depth::after_taa(3, 2, 6, 4);
-    kc::ui_depth::before_draw(ctx.Get(), ps.Get());
-    check(kc::ui_depth::eligible_frames() == 1, "identified UI pass");
+    kc::ui_depth::DrawState disabled_scope;
+    kc::ui_depth::before_draw(nullptr, ps.Get(), disabled_scope);
+    check(!disabled_scope.depth, "OFF fast path performs no context access");
+    correct(ctx.Get(), ps.Get());
+    check(kc::ui_depth::eligible_frames() == 0, "OFF bypasses UI classification");
     check(read(dev.Get(), ctx.Get(), depth.Get()) == initial, "OFF leaves depth and stencil intact");
     kc::ui_depth::set_enabled(true);
     kc::ui_depth::after_taa(3, 2, 6, 4);
-    kc::ui_depth::before_draw(ctx.Get(), ps.Get());
+    auto aligned = correct(ctx.Get(), ps.Get());
     check(kc::ui_depth::corrected_frames() == 1, "one depth correction");
-    auto got = read(dev.Get(), ctx.Get(), depth.Get());
+    check(aligned.Get() != depth.Get(), "private depth bound only during UI draw");
+    auto got = read(dev.Get(), ctx.Get(), aligned.Get());
+    check(read(dev.Get(), ctx.Get(), depth.Get()) == initial,
+          "later readers see unchanged engine depth and stencil");
     bool values = true, masks = true;
     for (unsigned y = 0; y < 4; ++y)
         for (unsigned x = 0; x < 6; ++x) {
@@ -151,12 +179,24 @@ int wmain(int argc, wchar_t **argv) {
     check(current_rt == rtv.Get() && current_ds.Get() == dsv.Get(), "render and depth targets restored");
     if (current_rt)
         current_rt->Release();
-    kc::ui_depth::before_draw(ctx.Get(), ps.Get());
-    check(kc::ui_depth::corrected_frames() == 1 && read(dev.Get(), ctx.Get(), depth.Get()) == got,
-          "no double-resampling in one frame");
+    auto repeated = correct(ctx.Get(), ps.Get());
+    check(kc::ui_depth::corrected_frames() == 1 && repeated.Get() == aligned.Get() &&
+              read(dev.Get(), ctx.Get(), repeated.Get()) == got,
+          "same private depth reused without double-resampling");
+    dv.Flags = D3D11_DSV_READ_ONLY_DEPTH | D3D11_DSV_READ_ONLY_STENCIL;
+    ComPtr<ID3D11DepthStencilView> read_only;
+    check(SUCCEEDED(dev->CreateDepthStencilView(depth.Get(), &dv, &read_only)), "read-only engine DSV");
+    ctx->OMSetRenderTargets(1, &rt, read_only.Get());
+    UINT private_flags = 0;
+    auto readonly_aligned = correct(ctx.Get(), ps.Get(), &private_flags);
+    check(private_flags == dv.Flags && readonly_aligned.Get() == aligned.Get(),
+          "private DSV retains read-only depth and stencil flags");
+    dv.Flags = 0;
+    ctx->OMSetRenderTargets(1, &rt, dsv.Get());
     kc::ui_depth::after_taa(6, 4, 6, 4);
-    kc::ui_depth::before_draw(ctx.Get(), ps.Get());
-    check(kc::ui_depth::corrected_frames() == 1 && read(dev.Get(), ctx.Get(), depth.Get()) == got,
+    auto native_depth = correct(ctx.Get(), ps.Get());
+    check(kc::ui_depth::corrected_frames() == 1 && native_depth.Get() == depth.Get() &&
+              read(dev.Get(), ctx.Get(), depth.Get()) == initial,
           "100 percent mode bypasses correction");
     for (UINT render_size : {8u, 7u, 6u, 4u}) {
         const UINT native = 12;
@@ -188,8 +228,8 @@ int wmain(int argc, wchar_t **argv) {
         D3D11_VIEWPORT test_vp = {0, 0, float(native), float(native), 0, 1};
         ctx->RSSetViewports(1, &test_vp);
         kc::ui_depth::after_taa(render_size, render_size, native, native);
-        kc::ui_depth::before_draw(ctx.Get(), ps.Get());
-        auto result = read(dev.Get(), ctx.Get(), test_depth.Get());
+        auto test_aligned = correct(ctx.Get(), ps.Get());
+        auto result = read(dev.Get(), ctx.Get(), test_aligned.Get());
         bool ratio_ok = true;
         for (UINT y = 0; y < native; ++y)
             for (UINT x = 0; x < native; ++x) {
@@ -203,7 +243,17 @@ int wmain(int argc, wchar_t **argv) {
         char label[96]{};
         sprintf_s(label, "ratio %u/%u depth mapping and stencil protection", render_size, native);
         check(ratio_ok, label);
+        check(read(dev.Get(), ctx.Get(), test_depth.Get()) == input, "ratio engine depth never overwritten");
         check(read(dev.Get(), ctx.Get(), test_colour.Get()) == test_colours, "ratio RGBA unchanged");
     }
+    const auto corrected = kc::ui_depth::corrected_frames();
+    kc::ui_depth::set_enabled(false);
+    kc::frame_dump::capture = true;
+    kc::ui_depth::after_taa(4, 4, 12, 12);
+    auto captured = correct(ctx.Get(), ps.Get());
+    auto duplicate_capture = correct(ctx.Get(), ps.Get());
+    check(kc::frame_dump::saved == 1 && kc::ui_depth::corrected_frames() == corrected &&
+              captured.Get() == duplicate_capture.Get(), "OFF with armed dump exports once without correction");
+    kc::frame_dump::capture = false;
     return 0;
 }
