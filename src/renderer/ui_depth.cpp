@@ -19,6 +19,8 @@ auto &g_ui = *new std::map<ID3D11PixelShader *, ComPtr<ID3D11PixelShader>>;
 std::atomic_uint64_t g_eligible{0}, g_corrected{0};
 UINT g_rw = 0, g_rh = 0, g_w = 0, g_h = 0;
 uint64_t g_serial = 0, g_done = 0;
+uintptr_t g_source = 0;
+bool g_ready = false;
 ULONGLONG g_time = 0;
 
 struct Resources {
@@ -28,7 +30,8 @@ struct Resources {
     ComPtr<ID3D11Buffer> params;
     ComPtr<ID3D11DepthStencilState> write_depth, no_depth;
     ComPtr<ID3D11BlendState> opaque;
-    ComPtr<ID3D11Texture2D> copy, export_texture;
+    ComPtr<ID3D11Texture2D> copy, corrected, export_texture;
+    ComPtr<ID3D11DepthStencilView> corrected_write, corrected_read[4];
     ComPtr<ID3D11ShaderResourceView> srv;
     ComPtr<ID3D11RenderTargetView> export_rtv;
     UINT w = 0, h = 0;
@@ -103,29 +106,37 @@ bool setup(ID3D11Device *device, const D3D11_TEXTURE2D_DESC &source) {
             return false;
         }
     }
-    DXGI_FORMAT format, view;
+    DXGI_FORMAT format, view, depth_format;
     switch (source.Format) {
     case DXGI_FORMAT_R24G8_TYPELESS:
     case DXGI_FORMAT_D24_UNORM_S8_UINT:
         format = DXGI_FORMAT_R24G8_TYPELESS;
         view = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        depth_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         break;
     case DXGI_FORMAT_R32G8X24_TYPELESS:
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
         format = DXGI_FORMAT_R32G8X24_TYPELESS;
         view = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         break;
     case DXGI_FORMAT_R32_TYPELESS:
     case DXGI_FORMAT_D32_FLOAT:
         format = DXGI_FORMAT_R32_TYPELESS;
         view = DXGI_FORMAT_R32_FLOAT;
+        depth_format = DXGI_FORMAT_D32_FLOAT;
         break;
     default:
         return false;
     }
-    if (g.copy && g.w == source.Width && g.h == source.Height && g.format == format)
+    if (g.copy && g.corrected && g.corrected_write &&
+        g.w == source.Width && g.h == source.Height && g.format == format)
         return true;
     g.copy.Reset();
+    g.corrected.Reset();
+    g.corrected_write.Reset();
+    for (auto &read : g.corrected_read)
+        read.Reset();
     g.srv.Reset();
     g.export_rtv.Reset();
     g.export_texture.Reset();
@@ -143,6 +154,14 @@ bool setup(ID3D11Device *device, const D3D11_TEXTURE2D_DESC &source) {
     sv.Texture2D.MipLevels = 1;
     if (SUCCEEDED(hr))
         hr = device->CreateShaderResourceView(g.copy.Get(), &sv, &g.srv);
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (SUCCEEDED(hr))
+        hr = device->CreateTexture2D(&td, nullptr, &g.corrected);
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+    dv.Format = depth_format;
+    dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (SUCCEEDED(hr))
+        hr = device->CreateDepthStencilView(g.corrected.Get(), &dv, &g.corrected_write);
     if (FAILED(hr)) {
         g.copy.Reset();
         g.srv.Reset();
@@ -204,7 +223,18 @@ void export_snapshot(ID3D11DeviceContext *ctx, const char *name) {
 } // namespace
 
 void on_create_ps(const void *code, SIZE_T size, ID3D11PixelShader *shader) {
-    if (!shader)
+    // Match the existing screen-size classifier's cheap bytecode prefilter.
+    // Ordinary scene shaders do not need a second D3DReflect call for this fix.
+    auto contains = [&](const char *name) {
+        const SIZE_T length = strlen(name);
+        const auto *bytes = static_cast<const char *>(code);
+        for (SIZE_T i = 0; i + length <= size; ++i)
+            if (bytes[i] == name[0] && memcmp(bytes + i, name, length) == 0)
+                return true;
+        return false;
+    };
+    if (!shader || !code || !contains("PER_BATCH") ||
+        !contains("cBitmapColorTransform") || !contains("cPremultiplyAlpha"))
         return;
     ComPtr<ID3D11ShaderReflection> reflection;
     if (FAILED(D3DReflect(code, size, IID_PPV_ARGS(&reflection))))
@@ -235,19 +265,26 @@ void after_taa(UINT rw, UINT rh, UINT w, UINT h) {
     g_h = h;
     g_time = GetTickCount64();
     ++g_serial;
+    g_source = 0;
+    g_ready = false;
 }
 bool enabled() { return config().ui_depth_alignment; }
 void set_enabled(bool value) {
     config().ui_depth_alignment = value;
     config_save();
     g_done = 0;
+    g_ready = false;
     logf("ui_depth2: UI depth alignment %s (saved)", value ? "ON" : "OFF");
 }
 uint64_t eligible_frames() { return g_eligible.load(); }
 uint64_t corrected_frames() { return g_corrected.load(); }
 
-void before_draw(ID3D11DeviceContext *ctx, ID3D11PixelShader *shader) {
-    if (!g_serial || g_done == g_serial || !g_rw || !g_rh || g_rw >= g_w || g_rh >= g_h ||
+void before_draw(ID3D11DeviceContext *ctx, ID3D11PixelShader *shader, DrawState &state) {
+    const bool capture = frame_dump::armed();
+    if (!enabled() && !capture)
+        return; // No shader lookup, lock, context query or allocation when off.
+    if (!ctx || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
+        !g_serial || !g_rw || !g_rh || g_rw >= g_w || g_rh >= g_h ||
         GetTickCount64() - g_time > 500)
         return;
     {
@@ -262,14 +299,21 @@ void before_draw(ID3D11DeviceContext *ctx, ID3D11PixelShader *shader) {
         return;
     D3D11_DEPTH_STENCIL_DESC dd{};
     ds->GetDesc(&dd);
-    if (!dd.DepthEnable || dd.DepthFunc != D3D11_COMPARISON_GREATER_EQUAL || dd.StencilEnable)
+    if (!dd.DepthEnable || dd.DepthFunc != D3D11_COMPARISON_GREATER_EQUAL || dd.StencilEnable ||
+        dd.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO)
         return;
-    ID3D11RenderTargetView *raw[2] = {};
+    ID3D11RenderTargetView *raw[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ComPtr<ID3D11DepthStencilView> dsv;
-    ctx->OMGetRenderTargets(2, raw, &dsv);
-    ComPtr<ID3D11RenderTargetView> rtv, extra;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, raw, &dsv);
+    ComPtr<ID3D11RenderTargetView> rtv;
     rtv.Attach(raw[0]);
-    extra.Attach(raw[1]);
+    bool extra = false;
+    for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        if (raw[i]) {
+            extra = true;
+            raw[i]->Release();
+        }
+    }
     if (!dsv || !rtv || extra)
         return;
     D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
@@ -292,7 +336,27 @@ void before_draw(ID3D11DeviceContext *ctx, ID3D11PixelShader *shader) {
         td.SampleDesc.Count != 1 || cd.SampleDesc.Count != 1 || td.ArraySize != 1 || td.MipLevels != 1 ||
         vp.TopLeftX != 0 || vp.TopLeftY != 0 || vp.Width != float(g_w) || vp.Height != float(g_h))
         return;
+    ComPtr<IUnknown> identity;
+    if (FAILED(depth.As(&identity)))
+        return;
+    const uintptr_t source = reinterpret_cast<uintptr_t>(identity.Get());
+    const auto bind_corrected = [&] {
+        if (!enabled() || !g_ready || g_source != source || dv.Flags >= 4)
+            return;
+        auto &view = g.corrected_read[dv.Flags];
+        if (!view && FAILED(g.device->CreateDepthStencilView(g.corrected.Get(), &dv, &view)))
+            return;
+        state.colour = rtv;
+        state.depth = dsv;
+        auto *target = rtv.Get();
+        ctx->OMSetRenderTargets(1, &target, view.Get());
+    };
+    if (g_done == g_serial) {
+        bind_corrected();
+        return;
+    }
     g_done = g_serial;
+    g_source = source;
     ++g_eligible;
     static bool logged = false;
     if (!logged) {
@@ -302,49 +366,51 @@ void before_draw(ID3D11DeviceContext *ctx, ID3D11PixelShader *shader) {
              g_rw, g_rh, g_w, g_h, td.Format, dv.Flags, dd.DepthFunc, dd.DepthWriteMask,
              enabled() ? "ON" : "OFF");
     }
-    bool capture = frame_dump::armed();
-    if (!enabled() && !capture)
-        return;
     ComPtr<ID3D11Device> device;
     ctx->GetDevice(&device);
     if (!setup(device.Get(), td))
         return;
-    ComPtr<ID3D11DepthStencilView> write_dsv = dsv;
-    if (dv.Flags & D3D11_DSV_READ_ONLY_DEPTH) {
-        dv.Flags = 0;
-        write_dsv.Reset();
-        HRESULT hr = device->CreateDepthStencilView(depth.Get(), &dv, &write_dsv);
-        if (FAILED(hr)) {
-            logf("ui_depth1: writable DSV failed 0x%08lx", hr);
-            return;
+    {
+        StateBackup backup(ctx);
+        snapshot(ctx, depth.Get());
+        if (capture)
+            export_snapshot(ctx, "ui_depth_before");
+        if (enabled()) {
+            // Preserve the engine's resource, including every stencil bit. Only a
+            // private full-size copy is resampled and bound for qualifying UI draws.
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            ctx->CopyResource(g.corrected.Get(), depth.Get());
+            struct Params {
+                float scale[2];
+                UINT size[2];
+            } params = {{float(g_rw) / g_w, float(g_rh) / g_h}, {g_rw, g_rh}};
+            ctx->UpdateSubresource(g.params.Get(), 0, nullptr, &params, 0, 0);
+            auto *cb = g.params.Get();
+            ctx->PSSetConstantBuffers(0, 1, &cb);
+            ctx->OMSetRenderTargets(0, nullptr, g.corrected_write.Get());
+            ctx->OMSetDepthStencilState(g.write_depth.Get(), 0);
+            draw_state(ctx, g.depth_ps.Get());
+            ctx->Draw(3, 0);
+            ++g_corrected;
+            g_ready = true;
+            static bool fixed_logged = false;
+            if (!fixed_logged) {
+                fixed_logged = true;
+                logf("ui_depth: private menu depth resampled; engine depth, RGB and stencil unchanged");
+            }
+            if (capture) {
+                snapshot(ctx, g.corrected.Get());
+                export_snapshot(ctx, "ui_depth_after");
+            }
         }
-    }
-    StateBackup backup(ctx);
-    snapshot(ctx, depth.Get());
-    if (capture)
-        export_snapshot(ctx, "ui_depth_before");
-    if (enabled()) {
-        struct Params {
-            float scale[2];
-            UINT size[2];
-        } params = {{float(g_rw) / g_w, float(g_rh) / g_h}, {g_rw, g_rh}};
-        ctx->UpdateSubresource(g.params.Get(), 0, nullptr, &params, 0, 0);
-        auto *cb = g.params.Get();
-        ctx->PSSetConstantBuffers(0, 1, &cb);
-        ctx->OMSetRenderTargets(0, nullptr, write_dsv.Get());
-        ctx->OMSetDepthStencilState(g.write_depth.Get(), 0);
-        draw_state(ctx, g.depth_ps.Get());
-        ctx->Draw(3, 0);
-        ++g_corrected;
-        static bool fixed_logged = false;
-        if (!fixed_logged) {
-            fixed_logged = true;
-            logf("ui_depth1: depth resampled before UI; RGB and stencil writes disabled");
-        }
-        if (capture) {
-            snapshot(ctx, depth.Get());
-            export_snapshot(ctx, "ui_depth_after");
-        }
+    } // Restore the original context before installing the draw-local DSV.
+    bind_corrected();
+}
+
+void after_draw(ID3D11DeviceContext *ctx, const DrawState &state) {
+    if (state.depth) {
+        auto *target = state.colour.Get();
+        ctx->OMSetRenderTargets(1, &target, state.depth.Get());
     }
 }
 } // namespace kc::ui_depth
