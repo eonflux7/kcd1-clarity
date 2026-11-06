@@ -13,6 +13,7 @@
 #include "game/renderer.h"
 #include "game/symbols.h"
 #include "renderer/frame_dump.h"
+#include "renderer/ui_depth.h"
 #include "renderer/mip_bias.h"
 #include "renderer/shadow_noise.h"
 #include "renderer/state_backup.h"
@@ -541,6 +542,8 @@ bool on_taa_draw(ID3D11DeviceContext* ctx, const d3d11::TaaShader& taa) {
     g_status.render_height = render_h;
     g_status.target_width = td.Width;
     g_status.target_height = td.Height;
+    if (ok)
+        ui_depth::after_taa(render_w, render_h, td.Width, td.Height);
     ++g_status.frames;
     if (!ok)
         return fail("DLSS evaluate failed");

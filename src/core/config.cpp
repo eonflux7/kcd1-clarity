@@ -38,6 +38,7 @@ void config_load(const std::wstring& path) {
     g_config.temporal_shadow_noise =
         GetPrivateProfileIntW(L"dlss", L"temporal_shadow_noise", g_config.temporal_shadow_noise, f) != 0;
     g_config.edge_clamp = GetPrivateProfileIntW(L"dlss", L"edge_clamp", g_config.edge_clamp, f) != 0;
+    g_config.ui_depth_alignment = GetPrivateProfileIntW(L"dlss", L"ui_depth_alignment", g_config.ui_depth_alignment, f) != 0;
     g_config.d3d_debug = GetPrivateProfileIntW(L"debug", L"d3d_debug", g_config.d3d_debug, f) != 0;
     g_config.skip_ngx = GetPrivateProfileIntW(L"debug", L"skip_ngx", g_config.skip_ngx, f) != 0;
     g_config.engine_after = GetPrivateProfileIntW(L"debug", L"engine_after", g_config.engine_after, f) != 0;
@@ -67,6 +68,7 @@ void config_save() {
     WritePrivateProfileStringW(L"dlss", L"coarse_shadow_noise", g_config.coarse_shadow_noise ? L"1" : L"0", f);
     WritePrivateProfileStringW(L"dlss", L"temporal_shadow_noise", g_config.temporal_shadow_noise ? L"1" : L"0", f);
     WritePrivateProfileStringW(L"dlss", L"edge_clamp", g_config.edge_clamp ? L"1" : L"0", f);
+    WritePrivateProfileStringW(L"dlss", L"ui_depth_alignment", g_config.ui_depth_alignment ? L"1" : L"0", f);
     WritePrivateProfileStringW(L"debug", L"d3d_debug", g_config.d3d_debug ? L"1" : L"0", f);
     WritePrivateProfileStringW(L"debug", L"skip_ngx", g_config.skip_ngx ? L"1" : L"0", f);
     WritePrivateProfileStringW(L"debug", L"engine_after", g_config.engine_after ? L"1" : L"0", f);

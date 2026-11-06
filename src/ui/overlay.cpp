@@ -33,6 +33,7 @@
 #include "game/symbols.h"
 #include "hooks/d3d11_hooks.h"
 #include "renderer/frame_dump.h"
+#include "renderer/ui_depth.h"
 #include "renderer/mip_bias.h"
 #include "renderer/canary.h"
 #include "renderer/screen_size_fix.h"
@@ -353,6 +354,11 @@ static void draw_settings() {
     }
     if (ImGui::Checkbox("FPS counter", &config().show_fps))
         config_save();
+    bool align_menu_depth = ui_depth::enabled();
+    if (ImGui::Checkbox("Align menu depth (inventory portrait)", &align_menu_depth))
+        ui_depth::set_enabled(align_menu_depth);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Keeps inventory portraits in place below 100%% render scale. No effect at DLAA.");
 }
 
 static void draw_menu_window() {

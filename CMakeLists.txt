@@ -85,6 +85,7 @@ add_library(kcd_clarity SHARED
     src/renderer/screen_size_fix.cpp
     src/renderer/state_backup.cpp
     src/renderer/taa_dlss.cpp
+    src/renderer/ui_depth.cpp
     src/upscaler/dlss.cpp
     src/ui/input.cpp
     src/ui/overlay.cpp)
@@ -99,3 +100,15 @@ target_link_libraries(kcd_clarity PRIVATE minhook imgui delayimp d3dcompiler
     ${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib)
 target_link_options(kcd_clarity PRIVATE /DELAYLOAD:d3dcompiler_47.dll /DELAYLOAD:dwmapi.dll /IGNORE:4199
     /PDBALTPATH:%_PDB%)  # only the PDB file name in the DLL, not the build path
+
+option(KCD_BUILD_TESTS "Build the offscreen WARP renderer tests" OFF)
+if(KCD_BUILD_TESTS)
+    enable_testing()
+    add_executable(ui_depth_warp tests/ui_depth_warp.cpp
+        src/renderer/ui_depth.cpp src/renderer/state_backup.cpp src/core/config.cpp)
+    target_include_directories(ui_depth_warp PRIVATE src)
+    target_compile_definitions(ui_depth_warp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(ui_depth_warp PRIVATE /W4 /permissive-)
+    target_link_libraries(ui_depth_warp PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME ui_depth_warp COMMAND ui_depth_warp "${CMAKE_CURRENT_BINARY_DIR}/ui_depth_test.ini")
+endif()
