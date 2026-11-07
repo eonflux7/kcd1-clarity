@@ -14,8 +14,6 @@ struct Symbol {
     const char* confidence;
 };
 
-// WHGame-cf9f6dc3: sha256 cf9f6dc384edcf35c20647a912745ddb8adb5ba65953e329c24e89dd9c4381aa timestamp 0x69ccd815 version None
-inline constexpr uint32_t kTimestamp_WHGame = 0x69ccd815;
 
 enum class Id : uint32_t {
     CD3D9Renderer__CalculateResolutions_CustomRes,
@@ -47,6 +45,9 @@ enum class Id : uint32_t {
     Count
 };
 
+#ifndef KCD_GOG_SYMBOLS
+// WHGame-cf9f6dc3: sha256 cf9f6dc384edcf35c20647a912745ddb8adb5ba65953e329c24e89dd9c4381aa timestamp 0x69ccd815 version None
+inline constexpr uint32_t kTimestamp_WHGame = 0x69ccd815;
 inline constexpr Symbol kSymbols[] = {
     {"CD3D9Renderer::CalculateResolutions_CustomRes", "WHGame", "40 55 53 56 57 41 54 41 55 41 56 48 8D 6C 24 ? 48 81 EC B0 00 00 00 48 8B 05", 0, 0, 0x20742b4, "low"},
     {"CD3D9Renderer::ChangeResolution", "WHGame", "48 89 5C 24 10 48 89 6C 24 18 56 57 41 54 41 56 41 57 48 81 EC 90 00 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 80 00 00 00 80 B9 34 0F 00 00 00", 0, 0, 0x40f548, "high"},
@@ -75,5 +76,49 @@ inline constexpr Symbol kSymbols[] = {
     {"g_AntialiasingModeActive", "WHGame", nullptr, 0, 0, 0x358fcc4, "low"},
     {"g_TAAFrameIndex", "WHGame", nullptr, 0, 0, 0x2feb998, "medium"},
 };
+
+#else
+// WHGame.dll PE timestamp: 0x69CCE118
+inline constexpr uint32_t kTimestamp_WHGame = 0x69cce118;
+// Kingdom Come: Deliverance GOG
+// 15 RVA verified by pattern scanning.
+// 11 RVA supplied from manual reverse engineering.
+
+inline constexpr Symbol kSymbols[] = {
+    {"CD3D9Renderer::CalculateResolutions_CustomRes", "WHGame", "40 55 53 56 57 41 54 41 55 41 56 48 8D 6C 24 ? 48 81 EC B0 00 00 00 48 8B 05", 0, 0, 0x2036818, "low"},
+    {"CD3D9Renderer::ChangeResolution", "WHGame", "48 89 5C 24 10 48 89 6C 24 18 56 57 41 54 41 56 41 57 48 81 EC 90 00 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 80 00 00 00 80 B9 34 0F 00 00 00", 0, 0, 0x40D208, "high"},
+    {"CD3D9Renderer::RT_EndFrame", "WHGame", "4C 8B DC 53 55 57", 0, 0, 0x3DC7E8, "medium"},
+    {"CD3D9Renderer::RT_RenderScene", "WHGame", "48 89 5C 24 10 48 89 74 24 20 57 41 54", 0, 0, 0x3DFDE4, "medium"},
+    {"CD3D9Renderer::RT_SetCameraInfo", "WHGame", "48 8B C4 55 53 56 57 41 56 48 8D A8 ? ? ? ? 48 81 EC 00 02 00 00", 0, 0, 0x2EB768, "medium"},
+    {"CD3D9Renderer::SetCurDownscaleFactor", "WHGame", "40 53 48 83 EC 20 48 89 54 24 30 48 8B D9", 0, 0, 0x3DCDF0, "high"},
+    {"CD3D9Renderer::SetViewportDownscale", "WHGame", "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 57 48 83 EC 60 80 3D", 0, 0, 0x1F961A4, "high"},
+
+    {"CD3D9Renderer::vftable", "WHGame", nullptr, 0, 0, 0x23A46B8, "high"},
+
+    {"CPostAA::Render", "WHGame", "48 8B C4 48 89 58 08 55 56 57 41 54 41 55 41 56 41 57 48 8D A8 ? ? ? ? 48 81 EC 90 03 00 00", 0, 0, 0x2AF818, "high"},
+    {"CPostAA::RenderComposites", "WHGame", "48 8B C4 48 89 58 18 48 89 78 20 55 41 54", 0, 0, 0x2A9C88, "medium"},
+
+    {"CPostAA::vftable", "WHGame", nullptr, 0, 0, 0x2760610, "high"},
+
+    {"CSunShafts::IsVisible", "WHGame", "48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 41 56 48 83 EC 40 BA 01 00 00 00", 0, 0, 0x35D0F4, "high"},
+
+    {"CV_r_AntialiasingMode", "WHGame", nullptr, 0, 0, 0x374AFF8, "high"},
+    {"CV_r_AntialiasingTAAPattern", "WHGame", nullptr, 0, 0, 0x3742A58, "high"},
+    {"CV_r_CustomResWidth", "WHGame", nullptr, 0, 0, 0x374AF64, "high"},
+    {"CV_r_MotionBlur", "WHGame", nullptr, 0, 0, 0x3742A8C, "high"},
+    {"CV_r_ReverseDepth", "WHGame", nullptr, 0, 0, 0x3742C60, "high"},
+    {"CV_r_Supersampling", "WHGame", nullptr, 0, 0, 0x3742A1C, "high"},
+
+    {"DeviceInfo_CreateDevice", "WHGame", "48 8B C4 48 89 58 10 48 89 70 18 48 89 78 20 55 41 54 41 55 41 56 41 57 48 8D 68 ? 48 81 EC B0 00 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 45 07", 0, 0, 0x2007A78, "high"},
+    {"HaltonRadicalInverse", "WHGame", "F3 0F 10 15 ? ? ? ? 44 8B C2 8B C1", 0, 0, 0x20150A0, "high"},
+    {"PostAA_UpscaleImage", "WHGame", "48 89 5C 24 08 48 89 6C 24 10 56 48 83 EC 70", 0, 0, 0x2052564, "medium"},
+    {"SD3DPostEffectsUtils::DrawFullScreenTri", "WHGame", "48 8B C4 55 48 8D 68 ? 48 81 EC C0 00 00 00 0F 29 70 ? 0F 29 78 ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 45 27", 0, 0, 0x3BE700, "high"},
+    {"SD3DPostEffectsUtils::DrawFullScreenTriWPOS", "WHGame", "48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 55 48 8D 68 ? 48 81 EC C0 00 00 00 0F 29 70 ? 48 8B 05", 0, 0, 0x3BE4BC, "high"},
+
+    {"gRenDev", "WHGame", nullptr, 0, 0, 0x3482580, "high"},
+    {"g_AntialiasingModeActive", "WHGame", nullptr, 0, 0, 0x354B8C0, "low"},
+    {"g_TAAFrameIndex", "WHGame", nullptr, 0, 0, 0x2FA7608, "medium"},
+};
+#endif
 
 }  // namespace kcd::sym
