@@ -35,7 +35,7 @@ ui_depth_alignment=1
 
 The setting defaults to off and is persisted. After a successful lower-resolution
 TAA resolve, the correction runs before the first matching native-resolution
-Scaleform solid-colour pass. It snapshots depth, copies the complete depth/stencil
+Scaleform solid-colour or single-texture bitmap pass. It snapshots depth, copies the complete depth/stencil
 resource into a private texture, and nearest-resamples depth in that private
 texture using the actual render/target dimensions. Colour and stencil writes
 remain disabled. Each matching draw temporarily binds the private DSV; its scope
@@ -87,6 +87,39 @@ context-state and original-DSV restoration, reuse without repeated resampling,
 read-only DSV flags, disabled fast-path behavior, diagnostic-only capture, and
 the engine depth/stencil remaining byte-for-byte intact for later readers.
 It does not require or alter a game installation.
+
+## Follow-up: bitmap menu passes
+
+The private-DSV implementation in `v0.3.0-pre.2` still reproduced the missing
+portrait and small black silhouette at Quality on RTX 4060, 2560x1440. Its log
+confirmed that correction was enabled and executed, without OptiScaler loaded.
+A frame dump showed the private depth silhouette already aligned to the enlarged
+portrait, while the final menu still contained the small silhouette. DLAA was
+normal.
+
+The earlier in-place implementation implicitly corrected depth for all subsequent
+menu draws. The private implementation restored the engine DSV after each draw,
+but classified only solid-colour shaders. Captured menu sequences also use bitmap
+Scaleform shaders, so those draws still depth-tested against the original small
+silhouette.
+
+The follow-up accepts the same used `PER_BATCH` variables at the same offsets,
+with either only that cbuffer at b0, or additionally a single 2D `texMap0` texture
+at t0 and sampler at s0. Other resource layouts remain excluded. Both menu shader
+classes reuse the aligned private DSV under the existing viewport, target,
+comparison and read-only-depth guards; every draw still restores the engine DSV.
+The original engine depth/stencil resource remains unchanged.
+
+WARP coverage now includes alternating solid and bitmap shader classes followed
+by an actual textured draw. The test checks the final colour mask around the
+enlarged silhouette and verifies that engine depth is unchanged. The original
+classifier fails the new bitmap regression; the extended classifier passes it
+along with the existing tests. The user reported correct portraits at Quality
+(66.7%) and Ultra Performance (33.3%) in the follow-up game test. Repeated
+inventory/map opening and closing, and returning to the scene, also remained
+normal according to the user. A successful Quality frame dump was saved and
+its final menu showed the correctly positioned, coloured portrait without the
+small black silhouette. Other hardware and long sessions remain unverified.
 
 No game files, proprietary runtime DLLs, user paths, saves, credentials or raw
 session logs are included in this contribution.

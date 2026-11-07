@@ -183,6 +183,83 @@ int wmain(int argc, wchar_t **argv) {
     check(kc::ui_depth::corrected_frames() == 1 && repeated.Get() == aligned.Get() &&
               read(dev.Get(), ctx.Get(), repeated.Get()) == got,
           "same private depth reused without double-resampling");
+    // Regression: the real menu alternates solid-colour and textured Scaleform
+    // draws. A corrected solid pass followed by an uncorrected bitmap pass still
+    // leaves the small portrait silhouette in the final menu.
+    const char bitmap_source[] =
+        R"(cbuffer PER_BATCH:register(b0){row_major float2x4 cBitmapColorTransform;float cPremultiplyAlpha;};Texture2D texMap0:register(t0);SamplerState bitmapSampler:register(s0);float4 main(float4 pos:SV_Position,float4 c:COLOR0):SV_Target{float4 t=texMap0.Sample(bitmapSampler,float2(0.5,0.5))*c*cBitmapColorTransform[0]+cBitmapColorTransform[1];return cPremultiplyAlpha!=0?t*t.w:t;})";
+    ComPtr<ID3DBlob> bitmap_code;
+    check(SUCCEEDED(D3DCompile(bitmap_source, sizeof(bitmap_source) - 1, nullptr, nullptr, nullptr,
+                               "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bitmap_code, &error)),
+          "bitmap UI shader compile");
+    ComPtr<ID3D11PixelShader> bitmap_ps;
+    check(SUCCEEDED(dev->CreatePixelShader(bitmap_code->GetBufferPointer(), bitmap_code->GetBufferSize(),
+                                         nullptr, &bitmap_ps)), "bitmap UI shader create");
+    kc::ui_depth::on_create_ps(bitmap_code->GetBufferPointer(), bitmap_code->GetBufferSize(), bitmap_ps.Get());
+    ctx->PSSetShader(bitmap_ps.Get(), nullptr, 0);
+    auto bitmap_depth = correct(ctx.Get(), bitmap_ps.Get());
+    check(bitmap_depth.Get() == aligned.Get() && kc::ui_depth::corrected_frames() == 1,
+          "bitmap UI draw reuses the solid pass aligned depth");
+    const char menu_vs[] =
+        R"(struct O{float4 p:SV_Position;float4 c:COLOR0;};O main(uint id:SV_VertexID){O o;float2 uv=float2((id<<1)&2,id&2);o.p=float4(uv*float2(2,-2)+float2(-1,1),0.5,1);o.c=1;return o;})";
+    ComPtr<ID3DBlob> menu_vs_code;
+    check(SUCCEEDED(D3DCompile(menu_vs, sizeof(menu_vs) - 1, nullptr, nullptr, nullptr, "main", "vs_5_0",
+                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &menu_vs_code, &error)), "menu VS compile");
+    ComPtr<ID3D11VertexShader> menu_vertex;
+    check(SUCCEEDED(dev->CreateVertexShader(menu_vs_code->GetBufferPointer(), menu_vs_code->GetBufferSize(),
+                                          nullptr, &menu_vertex)), "menu VS create");
+    const float transform[12] = {1, 1, 1, 1};
+    D3D11_BUFFER_DESC cb_desc{};
+    cb_desc.ByteWidth = sizeof(transform);
+    cb_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA cb_data{};
+    cb_data.pSysMem = transform;
+    ComPtr<ID3D11Buffer> menu_params;
+    check(SUCCEEDED(dev->CreateBuffer(&cb_desc, &cb_data, &menu_params)), "bitmap UI parameters");
+    D3D11_TEXTURE2D_DESC bitmap_desc{};
+    bitmap_desc.Width = bitmap_desc.Height = bitmap_desc.MipLevels = bitmap_desc.ArraySize = 1;
+    bitmap_desc.SampleDesc.Count = 1;
+    bitmap_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    bitmap_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    bitmap_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    const unsigned menu_green = 0xff00ff00;
+    D3D11_SUBRESOURCE_DATA bitmap_data{};
+    bitmap_data.pSysMem = &menu_green;
+    bitmap_data.SysMemPitch = sizeof(menu_green);
+    ComPtr<ID3D11Texture2D> bitmap_texture;
+    check(SUCCEEDED(dev->CreateTexture2D(&bitmap_desc, &bitmap_data, &bitmap_texture)), "bitmap texture");
+    ComPtr<ID3D11ShaderResourceView> bitmap_srv;
+    check(SUCCEEDED(dev->CreateShaderResourceView(bitmap_texture.Get(), nullptr, &bitmap_srv)), "bitmap SRV");
+    D3D11_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    ComPtr<ID3D11SamplerState> bitmap_sampler;
+    check(SUCCEEDED(dev->CreateSamplerState(&sampler_desc, &bitmap_sampler)), "bitmap sampler");
+    auto *menu_cb = menu_params.Get();
+    auto *menu_srv = bitmap_srv.Get();
+    auto *menu_sampler = bitmap_sampler.Get();
+    ctx->VSSetShader(menu_vertex.Get(), nullptr, 0);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->PSSetConstantBuffers(0, 1, &menu_cb);
+    ctx->PSSetShaderResources(0, 1, &menu_srv);
+    ctx->PSSetSamplers(0, 1, &menu_sampler);
+    kc::ui_depth::DrawState bitmap_scope;
+    kc::ui_depth::before_draw(ctx.Get(), bitmap_ps.Get(), bitmap_scope);
+    ctx->Draw(3, 0);
+    kc::ui_depth::after_draw(ctx.Get(), bitmap_scope);
+    auto bitmap_result = read(dev.Get(), ctx.Get(), colour.Get());
+    bool composition_ok = true;
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 6; ++x)
+            composition_ok &= bitmap_result[y * 6 + x] ==
+                ((x / 2 == 1 && y / 2 == 0) ? colours[y * 6 + x] : menu_green);
+    check(composition_ok, "textured menu preserves the enlarged silhouette, not the small one");
+    check(read(dev.Get(), ctx.Get(), depth.Get()) == initial, "bitmap draw leaves engine depth unchanged");
+    ctx->UpdateSubresource(colour.Get(), 0, nullptr, colours.data(), 6 * 4, 0);
+    ctx->PSSetShader(ps.Get(), nullptr, 0);
     dv.Flags = D3D11_DSV_READ_ONLY_DEPTH | D3D11_DSV_READ_ONLY_STENCIL;
     ComPtr<ID3D11DepthStencilView> read_only;
     check(SUCCEEDED(dev->CreateDepthStencilView(depth.Get(), &dv, &read_only)), "read-only engine DSV");
