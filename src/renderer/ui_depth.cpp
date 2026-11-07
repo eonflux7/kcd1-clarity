@@ -240,11 +240,29 @@ void on_create_ps(const void *code, SIZE_T size, ID3D11PixelShader *shader) {
     if (FAILED(D3DReflect(code, size, IID_PPV_ARGS(&reflection))))
         return;
     D3D11_SHADER_DESC desc{};
-    if (FAILED(reflection->GetDesc(&desc)) || desc.BoundResources != 1)
+    if (FAILED(reflection->GetDesc(&desc)) ||
+        (desc.BoundResources != 1 && desc.BoundResources != 3))
         return;
-    D3D11_SHADER_INPUT_BIND_DESC binding{};
-    if (FAILED(reflection->GetResourceBindingDesc(0, &binding)) || binding.Type != D3D_SIT_CBUFFER ||
-        binding.BindPoint != 0)
+    bool batch = false, texture = false, sampler = false;
+    for (UINT i = 0; i < desc.BoundResources; ++i) {
+        D3D11_SHADER_INPUT_BIND_DESC binding{};
+        if (FAILED(reflection->GetResourceBindingDesc(i, &binding)) ||
+            binding.BindPoint != 0 || binding.BindCount != 1)
+            return;
+        if (binding.Type == D3D_SIT_CBUFFER && !strcmp(binding.Name, "PER_BATCH"))
+            batch = true;
+        else if (binding.Type == D3D_SIT_TEXTURE && !strcmp(binding.Name, "texMap0") &&
+                 binding.Dimension == D3D_SRV_DIMENSION_TEXTURE2D)
+            texture = true;
+        else if (binding.Type == D3D_SIT_SAMPLER)
+            sampler = true;
+        else
+            return;
+    }
+    // Scaleform paints the menu with solid-colour AND bitmap passes. All must
+    // depth-test against the same aligned silhouette; restoring the engine DSV
+    // after each draw makes matching only the first, solid pass insufficient.
+    if (!batch || texture != sampler || (desc.BoundResources == 3 && !texture))
         return;
     auto *buffer = reflection->GetConstantBufferByName("PER_BATCH");
     D3D11_SHADER_VARIABLE_DESC colour{}, premultiply{};
@@ -255,7 +273,7 @@ void on_create_ps(const void *code, SIZE_T size, ID3D11PixelShader *shader) {
         return;
     std::lock_guard lock(g_mutex);
     g_ui.emplace(shader, shader);
-    logf("ui_depth1: Scaleform solid-colour PS identified %p", shader);
+    logf("ui_depth3: Scaleform %s PS identified %p", texture ? "bitmap" : "solid-colour", shader);
 }
 
 void after_taa(UINT rw, UINT rh, UINT w, UINT h) {
