@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cwchar>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <vector>
@@ -31,6 +32,35 @@ static void check(bool ok, const char *msg) {
     }
     printf("PASS %s\n", msg);
 }
+// Profile APIs may silently fail on WSL/UNC shares. Keep the fixture on a
+// local volume even when the executable and CTest working directory are remote.
+static bool local_directory(const wchar_t *path) {
+    wchar_t volume[MAX_PATH]{};
+    if (!GetVolumePathNameW(path, volume, MAX_PATH))
+        return false;
+    const auto type = GetDriveTypeW(volume);
+    return type == DRIVE_FIXED || type == DRIVE_REMOVABLE || type == DRIVE_RAMDISK;
+}
+struct TestIni {
+    wchar_t path[MAX_PATH]{};
+    TestIni() {
+        wchar_t directory[MAX_PATH]{};
+        auto length = GetTempPathW(MAX_PATH, directory);
+        if (!length || length >= MAX_PATH || !local_directory(directory)) {
+            length = GetEnvironmentVariableW(L"LOCALAPPDATA", directory, MAX_PATH);
+            check(length && length < MAX_PATH &&
+                      wcscat_s(directory, L"\\Temp\\") == 0 && local_directory(directory),
+                  "local temporary directory available");
+            check(CreateDirectoryW(directory, nullptr) || GetLastError() == ERROR_ALREADY_EXISTS,
+                  "local temporary directory exists");
+        }
+        check(GetTempFileNameW(directory, L"kcu", 0, path) != 0, "unique local test INI created");
+    }
+    ~TestIni() {
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, path);
+        DeleteFileW(path);
+    }
+};
 static std::vector<unsigned> read(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex) {
     D3D11_TEXTURE2D_DESC d{};
     tex->GetDesc(&d);
@@ -69,9 +99,10 @@ static ComPtr<ID3D11Texture2D> correct(ID3D11DeviceContext *ctx, ID3D11PixelShad
     kc::ui_depth::after_draw(ctx, scope);
     return texture;
 }
-int wmain(int argc, wchar_t **argv) {
-    check(argc == 2, "test INI path supplied");
-    const std::wstring ini = argv[1];
+int wmain() {
+    // Static lifetime also cleans up when check() calls exit() on failure.
+    static TestIni test_ini;
+    const std::wstring ini = test_ini.path;
     kc::config_load(ini);
     kc::ui_depth::set_enabled(true);
     check(GetPrivateProfileIntW(L"dlss", L"ui_depth_alignment", 0, ini.c_str()) == 1,
